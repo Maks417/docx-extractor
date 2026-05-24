@@ -11,7 +11,7 @@ name = "docx-extractor-cli"
 # Version is rewritten at release time from the git tag (see
 # .github/workflows/release.yml). Keep this in sync with Cargo.toml manually
 # for local installs, but the tagged release is the source of truth.
-version = "0.4.0"
+version = "0.4.1"
 description = "Extract text, images, footnotes, comments, headers/footers, and tracked changes from .docx files as JSON — wraps the docx-extractor Rust binary."
 readme = "README.md"
 license = { text = "MIT" }

@@ -18,7 +18,7 @@ from ._runner import run as _run
 
 __all__ = ["extract", "DocxExtractorError", "__version__"]
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 
 class DocxExtractorError(RuntimeError):

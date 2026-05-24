@@ -197,13 +197,12 @@ jobs:
         # the option chain is fragile across pip/build versions; bdist_wheel
         # --plat-name is stable and supported.
         #
-        # `--python-tag=py3` is essential: BinaryDistribution.has_ext_modules
-        # is True so the wheel is non-pure, which would otherwise default the
-        # Python tag to the runner's interpreter (e.g. cp311) and lock the
-        # wheel to that exact Python version. We have no real C extension
-        # (the bundled binary is invoked via subprocess), so py3-none-<plat>
-        # is correct: any Python 3 on the right platform can use it.
-        run: python setup.py bdist_wheel --plat-name=${{ matrix.plat-name }} --python-tag=py3
+        # The py3-none-<plat> tag is set by setup.py via the _PlatformWheel
+        # override of bdist_wheel.get_tag — `--python-tag` alone is NOT
+        # sufficient because BinaryDistribution.has_ext_modules=True forces
+        # setuptools to default the ABI tag to the runner's interpreter
+        # (e.g. cp311), which would lock the wheel to one exact Python.
+        run: python setup.py bdist_wheel --plat-name=${{ matrix.plat-name }}
 
       - name: Inspect wheel (Linux only — confirm manylinux tag)
         if: matrix.plat-name == 'manylinux_2_28_x86_64'
