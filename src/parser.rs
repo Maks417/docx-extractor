@@ -345,11 +345,12 @@ pub fn parse_document(
                         para_list_level = v.parse().unwrap_or(0);
                     }
                 }
-                b"numId" if has(&ctx, Ctx::NumPr) => {
-                    // numId 0 means "remove list formatting" — not a real list item.
-                    if get_attr(e.attributes(), b"val").as_deref() != Some("0") {
-                        para_is_list = true;
-                    }
+                // numId 0 means "remove list formatting" — not a real list item.
+                b"numId"
+                    if has(&ctx, Ctx::NumPr)
+                        && get_attr(e.attributes(), b"val").as_deref() != Some("0") =>
+                {
+                    para_is_list = true;
                 }
                 b"tab" if has(&ctx, Ctx::Run) && !has(&ctx, Ctx::Del) => {
                     if table_depth(&ctx) == 0 {
@@ -490,8 +491,8 @@ fn extract_images(
 
     // Collect paths first to avoid borrow-while-iterating issues
     let entries: Vec<(String, String)> = rels
-        .iter()
-        .filter_map(|(_id, path)| {
+        .values()
+        .filter_map(|path| {
             let ext = std::path::Path::new(path)
                 .extension()
                 .and_then(|e| e.to_str())
