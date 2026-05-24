@@ -1,5 +1,9 @@
 # docx-extractor
 
+[![Build](https://github.com/Maks417/docx-extractor/actions/workflows/build.yml/badge.svg)](https://github.com/Maks417/docx-extractor/actions/workflows/build.yml)
+[![Release](https://github.com/Maks417/docx-extractor/actions/workflows/release.yml/badge.svg)](https://github.com/Maks417/docx-extractor/actions/workflows/release.yml)
+[![CodeQL](https://github.com/Maks417/docx-extractor/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/Maks417/docx-extractor/actions/workflows/github-code-scanning/codeql)
+
 A small Rust CLI that converts a `.docx` file into structured JSON — paragraphs, headings, lists, tables, footnotes, headers/footers, comments, tracked changes, and base64-encoded images. Designed to be consumed programmatically (e.g. by a [Claude skill](SKILL.md)) without needing Microsoft Office.
 
 ## Install
