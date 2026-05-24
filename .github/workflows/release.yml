@@ -20,7 +20,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact: docx-extractor-linux-x86_64
 
-          - os: macos-13  # last GitHub-hosted runner with Intel hardware
+          - os: macos-15-intel  # last GitHub-hosted runner with Intel hardware
             target: x86_64-apple-darwin
             artifact: docx-extractor-macos-x86_64
 
