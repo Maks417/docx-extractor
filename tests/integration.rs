@@ -115,18 +115,21 @@ fn simple_table() {
     assert_eq!(sections[0]["type"], "table");
     let rows = sections[0]["rows"].as_array().unwrap();
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0][0], "A");
-    assert_eq!(rows[0][1], "B");
-    assert_eq!(rows[1][0], "C");
-    assert_eq!(rows[1][1], "D");
+    assert_eq!(rows[0][0]["text"], "A");
+    assert_eq!(rows[0][1]["text"], "B");
+    assert_eq!(rows[1][0]["text"], "C");
+    assert_eq!(rows[1][1]["text"], "D");
 }
 
 #[test]
-fn tracked_deletion_skipped() {
+fn tracked_deletion_recorded_in_revisions() {
+    // Deleted text is NOT in body text, but IS surfaced in revisions[].
     let xml = wrap_body(
         r#"<w:p>
             <w:r><w:t>Keep</w:t></w:r>
-            <w:del><w:r><w:delText>Remove</w:delText></w:r></w:del>
+            <w:del w:author="Jane" w:date="2024-01-15T10:30:00Z">
+                <w:r><w:delText>Remove</w:delText></w:r>
+            </w:del>
         </w:p>"#,
     );
     let tmp = write_docx(&xml);
@@ -134,6 +137,38 @@ fn tracked_deletion_skipped() {
     let sections = doc["sections"].as_array().unwrap();
     assert_eq!(sections.len(), 1);
     assert_eq!(sections[0]["text"], "Keep");
+    let revisions = doc["revisions"].as_array().unwrap();
+    assert_eq!(revisions.len(), 1);
+    assert_eq!(revisions[0]["kind"], "delete");
+    assert_eq!(revisions[0]["text"], "Remove");
+    assert_eq!(revisions[0]["author"], "Jane");
+    assert_eq!(revisions[0]["anchor"]["section_index"], 0);
+}
+
+#[test]
+fn tracked_insertion_recorded_in_revisions() {
+    // Inserted text IS in body, AND is surfaced in revisions[].
+    let xml = wrap_body(
+        r#"<w:p>
+            <w:r><w:t>Hello </w:t></w:r>
+            <w:ins w:author="Jane" w:date="2024-01-15T10:30:00Z">
+                <w:r><w:t>brave new </w:t></w:r>
+            </w:ins>
+            <w:r><w:t>world</w:t></w:r>
+        </w:p>"#,
+    );
+    let tmp = write_docx(&xml);
+    let doc = run(&tmp);
+    let sections = doc["sections"].as_array().unwrap();
+    assert_eq!(sections[0]["text"], "Hello brave new world");
+    let revisions = doc["revisions"].as_array().unwrap();
+    assert_eq!(revisions.len(), 1);
+    assert_eq!(revisions[0]["kind"], "insert");
+    assert_eq!(revisions[0]["text"], "brave new ");
+    assert_eq!(revisions[0]["author"], "Jane");
+    assert_eq!(revisions[0]["anchor"]["section_index"], 0);
+    assert_eq!(revisions[0]["anchor"]["char_start"], 6);
+    assert_eq!(revisions[0]["anchor"]["char_end"], 16);
 }
 
 #[test]
@@ -172,19 +207,27 @@ fn multiple_paragraphs_in_cell_joined() {
     let tmp = write_docx(&xml);
     let doc = run(&tmp);
     let sections = doc["sections"].as_array().unwrap();
-    assert_eq!(sections[0]["rows"][0][0], "Line1\nLine2");
+    assert_eq!(sections[0]["rows"][0][0]["text"], "Line1\nLine2");
 }
 
 #[test]
-fn nested_table_content_dropped() {
-    // Only the outer table should appear; the inner table's cell text is dropped.
+fn nested_table_content_flattened() {
+    // Nested-table content is flattened into the outer cell text (rows joined
+    // by '\n', cells within a row joined by ' | ').
     let xml = wrap_body(
         r#"<w:tbl>
             <w:tr>
                 <w:tc>
                     <w:p><w:r><w:t>Outer</w:t></w:r></w:p>
                     <w:tbl>
-                        <w:tr><w:tc><w:p><w:r><w:t>Inner</w:t></w:r></w:p></w:tc></w:tr>
+                        <w:tr>
+                            <w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc>
+                            <w:tc><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc>
+                        </w:tr>
+                        <w:tr>
+                            <w:tc><w:p><w:r><w:t>C</w:t></w:r></w:p></w:tc>
+                            <w:tc><w:p><w:r><w:t>D</w:t></w:r></w:p></w:tc>
+                        </w:tr>
                     </w:tbl>
                 </w:tc>
             </w:tr>
@@ -195,8 +238,10 @@ fn nested_table_content_dropped() {
     let sections = doc["sections"].as_array().unwrap();
     assert_eq!(sections.len(), 1);
     assert_eq!(sections[0]["type"], "table");
-    // Inner table content not included in the cell
-    assert_eq!(sections[0]["rows"][0][0], "Outer");
+    let cell = sections[0]["rows"][0][0]["text"].as_str().unwrap();
+    assert!(cell.starts_with("Outer"), "got: {cell}");
+    assert!(cell.contains("A | B"), "got: {cell}");
+    assert!(cell.contains("C | D"), "got: {cell}");
 }
 
 #[test]
@@ -404,4 +449,172 @@ fn hyperlink_url_preserved() {
     assert_eq!(sections.len(), 1);
     let text = sections[0]["text"].as_str().unwrap();
     assert_eq!(text, "[click here](https://example.com)");
+}
+
+// ── Multi-file DOCX builder for advanced features ──────────────────────────────
+
+fn build_multifile_docx(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let cursor = Cursor::new(Vec::new());
+    let mut zip = ZipWriter::new(cursor);
+    let opts = SimpleFileOptions::default();
+    for (name, content) in files {
+        zip.start_file(*name, opts).unwrap();
+        zip.write_all(content).unwrap();
+    }
+    zip.finish().unwrap().into_inner()
+}
+
+fn write_multifile_docx(files: &[(&str, &[u8])]) -> NamedTempFile {
+    let mut tmp = tempfile::Builder::new().suffix(".docx").tempfile().unwrap();
+    tmp.write_all(&build_multifile_docx(files)).unwrap();
+    tmp
+}
+
+#[test]
+fn image_attached_to_paragraph() {
+    // 1x1 transparent PNG.
+    const PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    let rels_xml = r#"<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId7" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/>
+</Relationships>"#;
+
+    let doc_xml = wrap_body(
+        r#"<w:p>
+            <w:r><w:t>Before</w:t></w:r>
+            <w:r>
+              <w:drawing xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+                         xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+                <a:blip r:embed="rId7"/>
+              </w:drawing>
+            </w:r>
+            <w:r><w:t> after</w:t></w:r>
+        </w:p>"#,
+    );
+
+    let tmp = write_multifile_docx(&[
+        ("word/document.xml", doc_xml.as_bytes()),
+        ("word/_rels/document.xml.rels", rels_xml.as_bytes()),
+        ("word/media/image1.png", PNG),
+    ]);
+
+    let doc = run(&tmp);
+    let sections = doc["sections"].as_array().unwrap();
+    assert_eq!(sections.len(), 1);
+    assert_eq!(sections[0]["text"], "Before after");
+    let images_attached = sections[0]["images"].as_array().unwrap();
+    assert_eq!(images_attached.len(), 1);
+    assert_eq!(images_attached[0], "image1.png");
+    // Top-level images[] still has the file.
+    assert_eq!(doc["images"][0]["id"], "image1.png");
+}
+
+#[test]
+fn footnote_extracted() {
+    let footnotes_xml = r#"<?xml version="1.0"?>
+<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:footnote w:type="separator" w:id="0"><w:p><w:r><w:t>sep</w:t></w:r></w:p></w:footnote>
+  <w:footnote w:id="1">
+    <w:p><w:r><w:t>This is footnote one.</w:t></w:r></w:p>
+  </w:footnote>
+</w:footnotes>"#;
+
+    let doc_xml = wrap_body(
+        r#"<w:p>
+            <w:r><w:t>See note</w:t></w:r>
+            <w:r><w:footnoteReference w:id="1"/></w:r>
+            <w:r><w:t>.</w:t></w:r>
+        </w:p>"#,
+    );
+
+    let tmp = write_multifile_docx(&[
+        ("word/document.xml", doc_xml.as_bytes()),
+        ("word/footnotes.xml", footnotes_xml.as_bytes()),
+    ]);
+
+    let doc = run(&tmp);
+    let sections = doc["sections"].as_array().unwrap();
+    assert_eq!(sections[0]["text"], "See note.");
+    assert_eq!(sections[0]["footnote_refs"][0], 1);
+
+    let footnotes = doc["footnotes"].as_array().unwrap();
+    assert_eq!(footnotes.len(), 1);
+    assert_eq!(footnotes[0]["id"], 1);
+    assert_eq!(footnotes[0]["sections"][0]["text"], "This is footnote one.");
+}
+
+#[test]
+fn header_extracted() {
+    let header_xml = r#"<?xml version="1.0"?>
+<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:p><w:r><w:t>Page header text</w:t></w:r></w:p>
+</w:hdr>"#;
+
+    let rels_xml = r#"<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId10" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/>
+</Relationships>"#;
+
+    let doc_xml = format!(
+        "{}<w:body>{}<w:sectPr><w:headerReference w:type=\"default\" r:id=\"rId10\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"/></w:sectPr></w:body>{}",
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+        "<w:p><w:r><w:t>Body</w:t></w:r></w:p>",
+        "</w:document>"
+    );
+
+    let tmp = write_multifile_docx(&[
+        ("word/document.xml", doc_xml.as_bytes()),
+        ("word/_rels/document.xml.rels", rels_xml.as_bytes()),
+        ("word/header1.xml", header_xml.as_bytes()),
+    ]);
+
+    let doc = run(&tmp);
+    let headers = doc["headers"].as_array().unwrap();
+    assert_eq!(headers.len(), 1);
+    assert_eq!(headers[0]["type"], "default");
+    assert_eq!(headers[0]["sections"][0]["text"], "Page header text");
+}
+
+#[test]
+fn comment_extracted_with_anchor() {
+    let comments_xml = r#"<?xml version="1.0"?>
+<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:comment w:id="0" w:author="Reviewer" w:date="2024-02-01T12:00:00Z">
+    <w:p><w:r><w:t>Looks good.</w:t></w:r></w:p>
+  </w:comment>
+</w:comments>"#;
+
+    let doc_xml = wrap_body(
+        r#"<w:p>
+            <w:r><w:t>The </w:t></w:r>
+            <w:commentRangeStart w:id="0"/>
+            <w:r><w:t>quick brown</w:t></w:r>
+            <w:commentRangeEnd w:id="0"/>
+            <w:r><w:t> fox</w:t></w:r>
+        </w:p>"#,
+    );
+
+    let tmp = write_multifile_docx(&[
+        ("word/document.xml", doc_xml.as_bytes()),
+        ("word/comments.xml", comments_xml.as_bytes()),
+    ]);
+
+    let doc = run(&tmp);
+    let comments = doc["comments"].as_array().unwrap();
+    assert_eq!(comments.len(), 1);
+    assert_eq!(comments[0]["id"], 0);
+    assert_eq!(comments[0]["author"], "Reviewer");
+    assert_eq!(comments[0]["sections"][0]["text"], "Looks good.");
+    let anchor = &comments[0]["anchor"];
+    assert_eq!(anchor["section_index"], 0);
+    assert_eq!(anchor["char_start"], 4);
+    assert_eq!(anchor["char_end"], 15);
 }

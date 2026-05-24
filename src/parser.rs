@@ -3,14 +3,15 @@ use std::io::Read;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use quick_xml::events::attributes::Attributes;
-use quick_xml::events::Event;
+use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 use thiserror::Error;
 use zip::ZipArchive;
 
-use crate::output::{Document, Image, Metadata, Section};
+use crate::output::{
+    Anchor, Comment, Document, HeaderFooter, Image, Metadata, Note, Revision, Section, TableCell,
+};
 
-/// Errors that can occur while extracting a DOCX file.
 #[derive(Debug, Error)]
 pub enum ExtractError {
     #[error("IO error: {0}")]
@@ -23,7 +24,6 @@ pub enum ExtractError {
     NotDocx,
 }
 
-/// Extract text, images, and metadata from the DOCX file at `path`.
 pub fn extract(path: &str) -> Result<Document, ExtractError> {
     let file = std::fs::File::open(path)?;
     let mut archive = ZipArchive::new(file)?;
@@ -33,7 +33,25 @@ pub fn extract(path: &str) -> Result<Document, ExtractError> {
     }
 
     let rels = parse_relationships(&mut archive)?;
-    let sections = parse_document(&mut archive, &rels.hyperlinks)?;
+
+    // Parse the main document body.
+    let mut doc_xml = String::new();
+    archive
+        .by_name("word/document.xml")?
+        .read_to_string(&mut doc_xml)?;
+    let body = parse_body(&doc_xml, &rels);
+
+    // Headers & footers — collected via references found while parsing the body.
+    let headers = parse_header_footer_parts(&mut archive, &rels, &body.header_refs, "hdr")?;
+    let footers = parse_header_footer_parts(&mut archive, &rels, &body.footer_refs, "ftr")?;
+
+    // Footnotes & endnotes.
+    let footnotes = parse_notes_file(&mut archive, "word/footnotes.xml", b"footnote", &rels)?;
+    let endnotes = parse_notes_file(&mut archive, "word/endnotes.xml", b"endnote", &rels)?;
+
+    // Comments — bodies from comments.xml, anchors from the main body parse.
+    let comments = parse_comments_file(&mut archive, &rels, &body.comment_anchors)?;
+
     let images = extract_images(&mut archive, &rels.images)?;
     let metadata = parse_core_props(&mut archive)?;
 
@@ -46,7 +64,13 @@ pub fn extract(path: &str) -> Result<Document, ExtractError> {
     Ok(Document {
         source,
         metadata,
-        sections,
+        sections: body.sections,
+        headers,
+        footers,
+        footnotes,
+        endnotes,
+        comments,
+        revisions: body.revisions,
         images,
     })
 }
@@ -102,7 +126,6 @@ fn parse_core_props(
         buf.clear();
     }
 
-    // Return None if the file exists but all fields are empty.
     let has_any = meta.title.is_some()
         || meta.author.is_some()
         || meta.last_modified_by.is_some()
@@ -114,16 +137,16 @@ fn parse_core_props(
 
 // ── Relationships ──────────────────────────────────────────────────────────────
 
-struct Rels {
-    images: HashMap<String, String>,
-    hyperlinks: HashMap<String, String>,
+#[derive(Default)]
+pub struct Rels {
+    pub images: HashMap<String, String>,
+    pub hyperlinks: HashMap<String, String>,
+    pub headers: HashMap<String, String>, // rId → "word/header1.xml"
+    pub footers: HashMap<String, String>,
 }
 
 fn parse_relationships(archive: &mut ZipArchive<std::fs::File>) -> Result<Rels, ExtractError> {
-    let mut rels = Rels {
-        images: HashMap::new(),
-        hyperlinks: HashMap::new(),
-    };
+    let mut rels = Rels::default();
 
     let mut content = String::new();
     match archive.by_name("word/_rels/document.xml.rels") {
@@ -154,10 +177,13 @@ fn parse_relationships(archive: &mut ZipArchive<std::fs::File>) -> Result<Rels, 
 
                 if let (Some(id), Some(target)) = (id, target) {
                     if rel_type.contains("image") {
-                        // Target is relative to word/
                         rels.images.insert(id, format!("word/{target}"));
                     } else if rel_type.contains("hyperlink") {
                         rels.hyperlinks.insert(id, target);
+                    } else if rel_type.ends_with("/header") {
+                        rels.headers.insert(id, format!("word/{target}"));
+                    } else if rel_type.ends_with("/footer") {
+                        rels.footers.insert(id, format!("word/{target}"));
                     }
                 }
             }
@@ -171,10 +197,8 @@ fn parse_relationships(archive: &mut ZipArchive<std::fs::File>) -> Result<Rels, 
     Ok(rels)
 }
 
-// ── Document parser ────────────────────────────────────────────────────────────
+// ── Body parser ────────────────────────────────────────────────────────────────
 
-/// Tracks which XML elements are currently open. The vec acts as a nesting
-/// stack: Start pushes, End pops the rightmost matching tag.
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum Ctx {
     Body,
@@ -183,6 +207,7 @@ enum Ctx {
     NumPr,
     Run,
     Text,
+    Ins,
     Del,
     Tbl,
     Row,
@@ -203,45 +228,100 @@ fn pop_tag(ctx: &mut Vec<Ctx>, tag: Ctx) {
     }
 }
 
-pub fn parse_document(
-    archive: &mut ZipArchive<std::fs::File>,
-    hyperlink_rels: &HashMap<String, String>,
-) -> Result<Vec<Section>, ExtractError> {
-    let mut content = String::new();
-    archive
-        .by_name("word/document.xml")?
-        .read_to_string(&mut content)?;
+#[derive(Debug, Default)]
+pub struct ParsedBody {
+    pub sections: Vec<Section>,
+    pub revisions: Vec<Revision>,
+    pub comment_anchors: HashMap<u32, Anchor>,
+    pub header_refs: Vec<(String, String)>, // (type, rId)
+    pub footer_refs: Vec<(String, String)>,
+}
 
-    let mut reader = Reader::from_str(&content);
+struct SavedPara {
+    text: String,
+    style: Option<String>,
+    is_list: bool,
+    list_level: u8,
+    images: Vec<String>,
+    footnote_refs: Vec<u32>,
+    endnote_refs: Vec<u32>,
+}
+
+struct InsState {
+    author: Option<String>,
+    date: Option<String>,
+    start_pos: usize,
+    in_table: bool,
+}
+
+struct DelState {
+    author: Option<String>,
+    date: Option<String>,
+    buf: String,
+    in_table: bool,
+}
+
+struct CommentStart {
+    section_index: usize, // prospective index for current pending paragraph
+    char_start: usize,
+    in_table: bool,
+    finalized_end: Option<usize>, // set when the start paragraph is emitted, if range still open
+}
+
+/// Parse a "body" XML chunk — recognizes `<w:body>`, `<w:hdr>`, `<w:ftr>`,
+/// `<w:footnote>`, `<w:endnote>`, or `<w:comment>` as the body container.
+pub fn parse_body(xml: &str, rels: &Rels) -> ParsedBody {
+    let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(false);
-
-    let mut sections: Vec<Section> = Vec::new();
     let mut buf = Vec::new();
+
+    let mut out = ParsedBody::default();
     let mut ctx: Vec<Ctx> = Vec::new();
 
+    // Paragraph state.
     let mut para_style: Option<String> = None;
     let mut para_outline_level: Option<u8> = None;
     let mut para_text = String::new();
+    let mut para_images: Vec<String> = Vec::new();
+    let mut para_footnote_refs: Vec<u32> = Vec::new();
+    let mut para_endnote_refs: Vec<u32> = Vec::new();
     let mut para_is_list = false;
     let mut para_list_level: u8 = 0;
+
+    // Cell state.
     let mut cell_text = String::new();
+    let mut cell_images: Vec<String> = Vec::new();
+    let mut current_row: Vec<TableCell> = Vec::new();
+    let mut current_table: Vec<Vec<TableCell>> = Vec::new();
 
-    // Text-box tracking: suspend/restore outer paragraph state while inside a
-    // <w:txbxContent> so its paragraphs are processed independently.
+    // Text-box state.
     let mut txbx_depth: usize = 0;
-    let mut saved_outer_para: Option<(String, Option<String>, bool, u8)> = None;
-    let mut current_row: Vec<String> = Vec::new();
-    let mut current_table: Vec<Vec<String>> = Vec::new();
+    let mut saved_outer_para: Option<SavedPara> = None;
 
-    // Hyperlink tracking: URL of the currently open <w:hyperlink> and the
-    // text-buffer offset where its content starts (so we can wrap it on close).
+    // Hyperlink state.
     let mut hyperlink_url: Option<String> = None;
     let mut hyperlink_text_start: usize = 0;
 
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) => match e.local_name().as_ref() {
-                b"body" => ctx.push(Ctx::Body),
+    // Tracked-changes state.
+    let mut ins_stack: Vec<InsState> = Vec::new();
+    let mut del_stack: Vec<DelState> = Vec::new();
+
+    // Comment ranges state.
+    let mut open_comment_starts: HashMap<u32, CommentStart> = HashMap::new();
+
+    // Nested-table flatten state — content captured at table_depth >= 2.
+    let mut nested_cell = String::new();
+    let mut nested_row: Vec<String> = Vec::new();
+    let mut nested_rows: Vec<Vec<String>> = Vec::new();
+
+    while let Ok(event) = reader.read_event_into(&mut buf) {
+        match event {
+            Event::Start(ref e) => match e.local_name().as_ref() {
+                b"body" | b"hdr" | b"ftr" | b"footnote" | b"endnote" | b"comment"
+                    if !has(&ctx, Ctx::Body) =>
+                {
+                    ctx.push(Ctx::Body);
+                }
 
                 b"p" if has(&ctx, Ctx::Body) => {
                     let td = table_depth(&ctx);
@@ -251,13 +331,19 @@ pub fn parse_document(
                         para_style = None;
                         para_outline_level = None;
                         para_text.clear();
+                        para_images.clear();
+                        para_footnote_refs.clear();
+                        para_endnote_refs.clear();
                         para_is_list = false;
                         para_list_level = 0;
                     } else if td == 1 && in_cell && !cell_text.is_empty() {
-                        // Separate paragraphs within a cell with a newline.
                         cell_text.push('\n');
+                    } else if td >= 2 {
+                        // Nested paragraph — append newline separator to current nested cell.
+                        if !nested_cell.is_empty() && !nested_cell.ends_with('\n') {
+                            nested_cell.push('\n');
+                        }
                     }
-                    // td > 1: paragraph inside a nested table — ignore.
                 }
 
                 b"pPr" if has(&ctx, Ctx::Para) || has(&ctx, Ctx::Cell) => {
@@ -265,52 +351,95 @@ pub fn parse_document(
                 }
                 b"numPr" if has(&ctx, Ctx::ParaProps) => ctx.push(Ctx::NumPr),
 
-                b"r" if !has(&ctx, Ctx::Del)
-                    && (table_depth(&ctx) == 0 && has(&ctx, Ctx::Para)
-                        || table_depth(&ctx) == 1 && has(&ctx, Ctx::Cell)) =>
+                b"r" if (table_depth(&ctx) == 0 && has(&ctx, Ctx::Para)
+                    || table_depth(&ctx) == 1 && has(&ctx, Ctx::Cell)
+                    || table_depth(&ctx) >= 2 && has(&ctx, Ctx::Body)
+                    || has(&ctx, Ctx::Del)) =>
                 {
                     ctx.push(Ctx::Run);
                 }
                 b"t" if has(&ctx, Ctx::Run) => ctx.push(Ctx::Text),
+                b"delText" if has(&ctx, Ctx::Run) && has(&ctx, Ctx::Del) => ctx.push(Ctx::Text),
 
                 b"tbl" if has(&ctx, Ctx::Body) => {
                     ctx.push(Ctx::Tbl);
-                    if table_depth(&ctx) == 1 {
+                    let depth = table_depth(&ctx);
+                    if depth == 1 {
                         current_table.clear();
+                    } else if depth == 2 {
+                        nested_cell.clear();
+                        nested_row.clear();
+                        nested_rows.clear();
                     }
                 }
-                b"tr" if table_depth(&ctx) == 1 => {
-                    ctx.push(Ctx::Row);
-                    current_row.clear();
+                b"tr" => {
+                    let depth = table_depth(&ctx);
+                    if depth == 1 {
+                        ctx.push(Ctx::Row);
+                        current_row.clear();
+                    } else if depth >= 2 {
+                        ctx.push(Ctx::Row);
+                    }
                 }
-                b"tc" if table_depth(&ctx) == 1 && has(&ctx, Ctx::Row) => {
-                    ctx.push(Ctx::Cell);
-                    cell_text.clear();
+                b"tc" => {
+                    let depth = table_depth(&ctx);
+                    if depth == 1 && has(&ctx, Ctx::Row) {
+                        ctx.push(Ctx::Cell);
+                        cell_text.clear();
+                        cell_images.clear();
+                    } else if depth >= 2 && has(&ctx, Ctx::Row) {
+                        ctx.push(Ctx::Cell);
+                        nested_cell.clear();
+                    }
                 }
 
-                b"del" => ctx.push(Ctx::Del),
+                b"ins" => {
+                    ctx.push(Ctx::Ins);
+                    let in_table = table_depth(&ctx) >= 1;
+                    let start_pos = if in_table {
+                        cell_text.len()
+                    } else {
+                        para_text.len()
+                    };
+                    ins_stack.push(InsState {
+                        author: get_attr(e.attributes(), b"author"),
+                        date: get_attr(e.attributes(), b"date"),
+                        start_pos,
+                        in_table,
+                    });
+                }
+                b"del" => {
+                    ctx.push(Ctx::Del);
+                    let in_table = table_depth(&ctx) >= 1;
+                    del_stack.push(DelState {
+                        author: get_attr(e.attributes(), b"author"),
+                        date: get_attr(e.attributes(), b"date"),
+                        buf: String::new(),
+                        in_table,
+                    });
+                }
 
                 b"txbxContent" if has(&ctx, Ctx::Body) => {
                     txbx_depth += 1;
                     if txbx_depth == 1 {
-                        // Suspend the outer paragraph so text box paragraphs
-                        // are processed as independent top-level sections.
-                        saved_outer_para = Some((
-                            std::mem::take(&mut para_text),
-                            para_style.take(),
-                            para_is_list,
-                            para_list_level,
-                        ));
+                        saved_outer_para = Some(SavedPara {
+                            text: std::mem::take(&mut para_text),
+                            style: para_style.take(),
+                            is_list: para_is_list,
+                            list_level: para_list_level,
+                            images: std::mem::take(&mut para_images),
+                            footnote_refs: std::mem::take(&mut para_footnote_refs),
+                            endnote_refs: std::mem::take(&mut para_endnote_refs),
+                        });
                         para_is_list = false;
                         para_list_level = 0;
                     }
                 }
 
                 b"hyperlink" if has(&ctx, Ctx::Body) => {
-                    // Resolve external URL via relationship ID, or use anchor as "#anchor".
                     let url = e.attributes().flatten().find_map(|attr| {
                         if attr.key.as_ref() == b"r:id" {
-                            hyperlink_rels.get(lossy(&attr.value).as_str()).cloned()
+                            rels.hyperlinks.get(lossy(&attr.value).as_str()).cloned()
                         } else if attr.key.local_name().as_ref() == b"anchor" {
                             Some(format!("#{}", lossy(&attr.value)))
                         } else {
@@ -330,12 +459,11 @@ pub fn parse_document(
                 _ => {}
             },
 
-            Ok(Event::Empty(ref e)) => match e.local_name().as_ref() {
+            Event::Empty(ref e) => match e.local_name().as_ref() {
                 b"pStyle" if has(&ctx, Ctx::ParaProps) => {
                     para_style = get_attr(e.attributes(), b"val");
                 }
                 b"outlineLvl" if has(&ctx, Ctx::ParaProps) => {
-                    // Stores the outline depth (0 = top level) for localized heading styles.
                     if let Some(v) = get_attr(e.attributes(), b"val") {
                         para_outline_level = v.parse::<u8>().ok().filter(|&l| l <= 8);
                     }
@@ -345,99 +473,332 @@ pub fn parse_document(
                         para_list_level = v.parse().unwrap_or(0);
                     }
                 }
-                // numId 0 means "remove list formatting" — not a real list item.
                 b"numId"
                     if has(&ctx, Ctx::NumPr)
                         && get_attr(e.attributes(), b"val").as_deref() != Some("0") =>
                 {
                     para_is_list = true;
                 }
-                b"tab" if has(&ctx, Ctx::Run) && !has(&ctx, Ctx::Del) => {
-                    if table_depth(&ctx) == 0 {
-                        para_text.push('\t');
-                    } else if has(&ctx, Ctx::Cell) {
-                        cell_text.push('\t');
+                b"tab" if has(&ctx, Ctx::Run) => {
+                    push_text(
+                        "\t",
+                        &ctx,
+                        &mut para_text,
+                        &mut cell_text,
+                        &mut nested_cell,
+                        &mut del_stack,
+                    );
+                }
+                b"br" if has(&ctx, Ctx::Run) => {
+                    let s = if table_depth(&ctx) == 0 { "\n" } else { " " };
+                    push_text(
+                        s,
+                        &ctx,
+                        &mut para_text,
+                        &mut cell_text,
+                        &mut nested_cell,
+                        &mut del_stack,
+                    );
+                }
+
+                b"blip" if has(&ctx, Ctx::Run) => {
+                    if let Some(name) = image_filename_for(e, rels) {
+                        add_image_ref(&ctx, &mut para_images, &mut cell_images, name);
                     }
                 }
-                b"br" if has(&ctx, Ctx::Run) && !has(&ctx, Ctx::Del) => {
-                    if table_depth(&ctx) == 0 {
-                        para_text.push('\n');
-                    } else if has(&ctx, Ctx::Cell) {
-                        cell_text.push(' ');
+                b"imagedata" if has(&ctx, Ctx::Run) => {
+                    if let Some(name) = image_filename_for(e, rels) {
+                        add_image_ref(&ctx, &mut para_images, &mut cell_images, name);
                     }
                 }
+
+                b"footnoteReference" if has(&ctx, Ctx::Run) && table_depth(&ctx) == 0 => {
+                    if let Some(id) = get_attr(e.attributes(), b"id").and_then(|v| v.parse().ok()) {
+                        para_footnote_refs.push(id);
+                    }
+                }
+                b"endnoteReference" if has(&ctx, Ctx::Run) && table_depth(&ctx) == 0 => {
+                    if let Some(id) = get_attr(e.attributes(), b"id").and_then(|v| v.parse().ok()) {
+                        para_endnote_refs.push(id);
+                    }
+                }
+
+                b"commentRangeStart" if has(&ctx, Ctx::Body) => {
+                    if let Some(id) = get_attr(e.attributes(), b"id").and_then(|v| v.parse().ok()) {
+                        let in_table = table_depth(&ctx) >= 1;
+                        let (char_start, section_index) = if in_table {
+                            (cell_text.len(), out.sections.len())
+                        } else {
+                            (para_text.len(), out.sections.len())
+                        };
+                        open_comment_starts.insert(
+                            id,
+                            CommentStart {
+                                section_index,
+                                char_start,
+                                in_table,
+                                finalized_end: None,
+                            },
+                        );
+                    }
+                }
+                b"commentRangeEnd" if has(&ctx, Ctx::Body) => {
+                    if let Some(id) = get_attr(e.attributes(), b"id").and_then(|v| v.parse().ok()) {
+                        if let Some(start) = open_comment_starts.remove(&id) {
+                            let char_end = if let Some(end) = start.finalized_end {
+                                end
+                            } else if start.in_table {
+                                cell_text.len()
+                            } else {
+                                para_text.len()
+                            };
+                            out.comment_anchors.insert(
+                                id,
+                                Anchor {
+                                    section_index: start.section_index,
+                                    char_start: start.char_start,
+                                    char_end,
+                                },
+                            );
+                        }
+                    }
+                }
+
+                b"headerReference" if has(&ctx, Ctx::Body) => {
+                    let kind =
+                        get_attr(e.attributes(), b"type").unwrap_or_else(|| "default".into());
+                    if let Some(id) = e.attributes().flatten().find_map(|a| {
+                        if a.key.as_ref() == b"r:id" {
+                            Some(lossy(&a.value))
+                        } else {
+                            None
+                        }
+                    }) {
+                        out.header_refs.push((kind, id));
+                    }
+                }
+                b"footerReference" if has(&ctx, Ctx::Body) => {
+                    let kind =
+                        get_attr(e.attributes(), b"type").unwrap_or_else(|| "default".into());
+                    if let Some(id) = e.attributes().flatten().find_map(|a| {
+                        if a.key.as_ref() == b"r:id" {
+                            Some(lossy(&a.value))
+                        } else {
+                            None
+                        }
+                    }) {
+                        out.footer_refs.push((kind, id));
+                    }
+                }
+
                 _ => {}
             },
 
-            Ok(Event::End(ref e)) => match e.local_name().as_ref() {
-                b"body" => pop_tag(&mut ctx, Ctx::Body),
+            Event::End(ref e) => match e.local_name().as_ref() {
+                b"body" | b"hdr" | b"ftr" | b"footnote" | b"endnote" | b"comment" => {
+                    pop_tag(&mut ctx, Ctx::Body);
+                }
                 b"pPr" => pop_tag(&mut ctx, Ctx::ParaProps),
                 b"numPr" => pop_tag(&mut ctx, Ctx::NumPr),
-                b"t" => pop_tag(&mut ctx, Ctx::Text),
+                b"t" | b"delText" => pop_tag(&mut ctx, Ctx::Text),
                 b"r" => pop_tag(&mut ctx, Ctx::Run),
-                b"del" => pop_tag(&mut ctx, Ctx::Del),
+
+                b"ins" => {
+                    if let Some(state) = ins_stack.pop() {
+                        let end_pos = if state.in_table {
+                            cell_text.len()
+                        } else {
+                            para_text.len()
+                        };
+                        let buf = if state.in_table {
+                            &cell_text
+                        } else {
+                            &para_text
+                        };
+                        let text = buf[state.start_pos..end_pos.min(buf.len())].to_string();
+                        if !text.is_empty() {
+                            out.revisions.push(Revision {
+                                kind: "insert".into(),
+                                author: state.author,
+                                date: state.date,
+                                anchor: None, // anchor finalized on paragraph emit
+                                text,
+                            });
+                            // Mark for anchor wiring once the paragraph is emitted.
+                            // We store as the last revision; anchor set on para emit if section idx still unknown.
+                            // To keep this simple: anchor = current pending section index + char positions.
+                            let idx = out.revisions.len() - 1;
+                            out.revisions[idx].anchor = Some(Anchor {
+                                section_index: out.sections.len(),
+                                char_start: state.start_pos,
+                                char_end: end_pos,
+                            });
+                        }
+                    }
+                    pop_tag(&mut ctx, Ctx::Ins);
+                }
+                b"del" => {
+                    if let Some(state) = del_stack.pop() {
+                        if !state.buf.is_empty() {
+                            let pos = if state.in_table {
+                                cell_text.len()
+                            } else {
+                                para_text.len()
+                            };
+                            out.revisions.push(Revision {
+                                kind: "delete".into(),
+                                author: state.author,
+                                date: state.date,
+                                anchor: Some(Anchor {
+                                    section_index: out.sections.len(),
+                                    char_start: pos,
+                                    char_end: pos,
+                                }),
+                                text: state.buf,
+                            });
+                        }
+                    }
+                    pop_tag(&mut ctx, Ctx::Del);
+                }
 
                 b"p" if has(&ctx, Ctx::Body) && has(&ctx, Ctx::Para) => {
                     let td = table_depth(&ctx);
                     pop_tag(&mut ctx, Ctx::Para);
+
                     if td == 0 {
-                        let text = para_text.trim().to_string();
-                        if !text.is_empty() {
+                        let raw_len = para_text.len();
+                        let trimmed = para_text.trim();
+                        if !trimmed.is_empty() || !para_images.is_empty() {
+                            let text = trimmed.to_string();
+                            let leading = para_text.len() - para_text.trim_start().len();
+
+                            // Adjust char positions of any open comments started in this paragraph
+                            // and any revisions targeting this section.
+                            for cs in open_comment_starts.values_mut() {
+                                if cs.section_index == out.sections.len()
+                                    && cs.finalized_end.is_none()
+                                {
+                                    cs.finalized_end = Some(raw_len.saturating_sub(leading));
+                                    cs.char_start = cs.char_start.saturating_sub(leading);
+                                }
+                            }
+                            for rev in out.revisions.iter_mut() {
+                                if let Some(anchor) = rev.anchor.as_mut() {
+                                    if anchor.section_index == out.sections.len() {
+                                        anchor.char_start =
+                                            anchor.char_start.saturating_sub(leading);
+                                        anchor.char_end = anchor.char_end.saturating_sub(leading);
+                                    }
+                                }
+                            }
+
+                            let images = std::mem::take(&mut para_images);
+                            let footnote_refs = std::mem::take(&mut para_footnote_refs);
+                            let endnote_refs = std::mem::take(&mut para_endnote_refs);
+
                             if para_is_list {
-                                sections.push(Section::ListItem {
+                                out.sections.push(Section::ListItem {
                                     level: para_list_level,
                                     text,
+                                    images,
+                                    footnote_refs,
+                                    endnote_refs,
                                 });
                             } else {
-                                // Try English style name first, then outlineLvl fallback.
                                 let level = para_style
                                     .as_deref()
                                     .and_then(heading_level)
                                     .or_else(|| para_outline_level.map(|l| l + 1));
                                 match level {
-                                    Some(level) => sections.push(Section::Heading { level, text }),
-                                    None => sections.push(Section::Paragraph { text }),
+                                    Some(level) => out.sections.push(Section::Heading {
+                                        level,
+                                        text,
+                                        images,
+                                        footnote_refs,
+                                        endnote_refs,
+                                    }),
+                                    None => out.sections.push(Section::Paragraph {
+                                        text,
+                                        images,
+                                        footnote_refs,
+                                        endnote_refs,
+                                    }),
                                 }
                             }
                         }
                         para_style = None;
                         para_outline_level = None;
                         para_text.clear();
+                        para_images.clear();
+                        para_footnote_refs.clear();
+                        para_endnote_refs.clear();
                         para_is_list = false;
                         para_list_level = 0;
                     }
                 }
 
-                b"tc" if table_depth(&ctx) == 1 && has(&ctx, Ctx::Row) => {
-                    pop_tag(&mut ctx, Ctx::Cell);
-                    current_row.push(cell_text.trim().to_string());
-                    cell_text.clear();
+                b"tc" => {
+                    let depth = table_depth(&ctx);
+                    if depth == 1 && has(&ctx, Ctx::Row) {
+                        pop_tag(&mut ctx, Ctx::Cell);
+                        current_row.push(TableCell {
+                            text: cell_text.trim().to_string(),
+                            images: std::mem::take(&mut cell_images),
+                        });
+                        cell_text.clear();
+                    } else if depth >= 2 && has(&ctx, Ctx::Row) {
+                        pop_tag(&mut ctx, Ctx::Cell);
+                        nested_row.push(nested_cell.trim().to_string());
+                        nested_cell.clear();
+                    }
                 }
-                b"tr" if table_depth(&ctx) == 1 => {
-                    pop_tag(&mut ctx, Ctx::Row);
-                    if !current_row.is_empty() {
-                        current_table.push(std::mem::take(&mut current_row));
+                b"tr" => {
+                    let depth = table_depth(&ctx);
+                    if depth == 1 {
+                        pop_tag(&mut ctx, Ctx::Row);
+                        if !current_row.is_empty() {
+                            current_table.push(std::mem::take(&mut current_row));
+                        }
+                    } else if depth >= 2 {
+                        pop_tag(&mut ctx, Ctx::Row);
+                        if !nested_row.is_empty() {
+                            nested_rows.push(std::mem::take(&mut nested_row));
+                        }
                     }
                 }
                 b"tbl" => {
-                    let td = table_depth(&ctx);
+                    let depth = table_depth(&ctx);
                     pop_tag(&mut ctx, Ctx::Tbl);
-                    if td == 1 && !current_table.is_empty() {
-                        sections.push(Section::Table {
+                    if depth == 1 && !current_table.is_empty() {
+                        out.sections.push(Section::Table {
                             rows: std::mem::take(&mut current_table),
                         });
+                    } else if depth == 2 {
+                        let rendered = nested_rows
+                            .iter()
+                            .map(|row| row.join(" | "))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        nested_rows.clear();
+                        if !rendered.is_empty() {
+                            if !cell_text.is_empty() && !cell_text.ends_with('\n') {
+                                cell_text.push('\n');
+                            }
+                            cell_text.push_str(&rendered);
+                        }
                     }
                 }
 
                 b"txbxContent" if has(&ctx, Ctx::Body) => {
                     if txbx_depth == 1 {
-                        if let Some((saved_text, saved_style, saved_is_list, saved_level)) =
-                            saved_outer_para.take()
-                        {
-                            para_text = saved_text;
-                            para_style = saved_style;
-                            para_is_list = saved_is_list;
-                            para_list_level = saved_level;
+                        if let Some(saved) = saved_outer_para.take() {
+                            para_text = saved.text;
+                            para_style = saved.style;
+                            para_is_list = saved.is_list;
+                            para_list_level = saved.list_level;
+                            para_images = saved.images;
+                            para_footnote_refs = saved.footnote_refs;
+                            para_endnote_refs = saved.endnote_refs;
                         }
                     }
                     txbx_depth = txbx_depth.saturating_sub(1);
@@ -445,7 +806,6 @@ pub fn parse_document(
 
                 b"hyperlink" if has(&ctx, Ctx::Body) => {
                     if let Some(url) = hyperlink_url.take() {
-                        // Wrap the text accumulated since the hyperlink opened.
                         let buf = if table_depth(&ctx) == 0 {
                             &mut para_text
                         } else {
@@ -462,23 +822,275 @@ pub fn parse_document(
                 _ => {}
             },
 
-            Ok(Event::Text(ref e)) if has(&ctx, Ctx::Text) => {
-                let text = e.unescape().unwrap_or_default();
-                if table_depth(&ctx) == 0 {
-                    para_text.push_str(&text);
-                } else {
-                    cell_text.push_str(&text);
-                }
+            Event::Text(ref e) if has(&ctx, Ctx::Text) => {
+                let text = e.unescape().unwrap_or_default().to_string();
+                push_text(
+                    &text,
+                    &ctx,
+                    &mut para_text,
+                    &mut cell_text,
+                    &mut nested_cell,
+                    &mut del_stack,
+                );
             }
 
-            Ok(Event::Eof) => break,
-            Err(e) => return Err(ExtractError::Xml(e)),
+            Event::Eof => break,
             _ => {}
         }
         buf.clear();
     }
 
-    Ok(sections)
+    out
+}
+
+// Route text to the right buffer based on current context. Deletions are
+// captured into the active <w:del>'s buffer instead of the visible text.
+fn push_text(
+    s: &str,
+    ctx: &[Ctx],
+    para_text: &mut String,
+    cell_text: &mut String,
+    nested_cell: &mut String,
+    del_stack: &mut [DelState],
+) {
+    if !del_stack.is_empty() {
+        if let Some(last) = del_stack.last_mut() {
+            last.buf.push_str(s);
+        }
+        return;
+    }
+    let depth = table_depth(ctx);
+    if depth == 0 {
+        para_text.push_str(s);
+    } else if depth == 1 && has(ctx, Ctx::Cell) {
+        cell_text.push_str(s);
+    } else if depth >= 2 {
+        nested_cell.push_str(s);
+    }
+}
+
+fn add_image_ref(
+    ctx: &[Ctx],
+    para_images: &mut Vec<String>,
+    cell_images: &mut Vec<String>,
+    name: String,
+) {
+    let depth = table_depth(ctx);
+    let target = if depth == 0 {
+        para_images
+    } else if depth >= 1 && has(ctx, Ctx::Cell) {
+        cell_images
+    } else {
+        return;
+    };
+    if !target.contains(&name) {
+        target.push(name);
+    }
+}
+
+fn image_filename_for(e: &BytesStart, rels: &Rels) -> Option<String> {
+    // a:blip uses r:embed; v:imagedata uses r:id.
+    for attr in e.attributes().flatten() {
+        let key = attr.key.as_ref();
+        if key == b"r:embed" || key == b"r:id" {
+            let rid = lossy(&attr.value);
+            if let Some(path) = rels.images.get(&rid) {
+                return std::path::Path::new(path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string());
+            }
+        }
+    }
+    None
+}
+
+// ── Header/footer & notes & comments file parsers ──────────────────────────────
+
+fn parse_header_footer_parts(
+    archive: &mut ZipArchive<std::fs::File>,
+    rels: &Rels,
+    refs: &[(String, String)],
+    _kind_tag: &str,
+) -> Result<Vec<HeaderFooter>, ExtractError> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let lookup = if _kind_tag == "hdr" {
+        &rels.headers
+    } else {
+        &rels.footers
+    };
+
+    for (kind, rid) in refs {
+        if !seen.insert(rid.clone()) {
+            continue;
+        }
+        let Some(path) = lookup.get(rid) else {
+            continue;
+        };
+        let mut xml = String::new();
+        match archive.by_name(path) {
+            Ok(mut f) => f.read_to_string(&mut xml)?,
+            Err(_) => continue,
+        };
+        let body = parse_body(&xml, rels);
+        if !body.sections.is_empty() {
+            out.push(HeaderFooter {
+                kind: kind.clone(),
+                sections: body.sections,
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn parse_notes_file(
+    archive: &mut ZipArchive<std::fs::File>,
+    path: &str,
+    note_tag: &[u8],
+    rels: &Rels,
+) -> Result<Vec<Note>, ExtractError> {
+    let mut xml = String::new();
+    match archive.by_name(path) {
+        Ok(mut f) => f.read_to_string(&mut xml)?,
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    let tag_str = std::str::from_utf8(note_tag).unwrap_or("");
+    let chunks = split_by_tag(&xml, tag_str);
+    let mut out = Vec::new();
+    for chunk in chunks {
+        // Skip separator notes (w:type="separator" or "continuationSeparator").
+        if let Some(t) = find_attr_in_open_tag(&chunk.opening, b"type") {
+            if t == "separator" || t == "continuationSeparator" {
+                continue;
+            }
+        }
+        let Some(id) =
+            find_attr_in_open_tag(&chunk.opening, b"id").and_then(|v| v.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        if id < 1 {
+            continue;
+        }
+        let body = parse_body(&chunk.full, rels);
+        if !body.sections.is_empty() {
+            out.push(Note {
+                id: id as u32,
+                sections: body.sections,
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn parse_comments_file(
+    archive: &mut ZipArchive<std::fs::File>,
+    rels: &Rels,
+    anchors: &HashMap<u32, Anchor>,
+) -> Result<Vec<Comment>, ExtractError> {
+    let mut xml = String::new();
+    match archive.by_name("word/comments.xml") {
+        Ok(mut f) => f.read_to_string(&mut xml)?,
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    let chunks = split_by_tag(&xml, "comment");
+    let mut out = Vec::new();
+    for chunk in chunks {
+        let id = match find_attr_in_open_tag(&chunk.opening, b"id").and_then(|v| v.parse().ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        let author = find_attr_in_open_tag(&chunk.opening, b"author");
+        let date = find_attr_in_open_tag(&chunk.opening, b"date");
+        let body = parse_body(&chunk.full, rels);
+        out.push(Comment {
+            id,
+            author,
+            date,
+            anchor: anchors.get(&id).cloned(),
+            sections: body.sections,
+        });
+    }
+    out.sort_by_key(|c| c.id);
+    Ok(out)
+}
+
+struct Chunk {
+    opening: String, // the opening tag like `<w:footnote w:id="1">`
+    full: String,    // full element including opening and closing tags
+}
+
+/// Split an XML document into chunks bounded by `<w:{tag} ...>` ... `</w:{tag}>`.
+/// Used to break footnotes.xml / endnotes.xml / comments.xml into entries.
+fn split_by_tag(xml: &str, tag: &str) -> Vec<Chunk> {
+    let open_prefix = format!("<w:{tag}");
+    let close_tag = format!("</w:{tag}>");
+    let bytes = xml.as_bytes();
+
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(rel) = xml[cursor..].find(&open_prefix) {
+        let start = cursor + rel;
+        // Reject false matches like `<w:footnoteReference` when looking for `<w:footnote`.
+        let after = bytes.get(start + open_prefix.len()).copied();
+        if !matches!(
+            after,
+            Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r') | Some(b'>') | Some(b'/')
+        ) {
+            cursor = start + open_prefix.len();
+            continue;
+        }
+
+        // Find end of the opening tag.
+        let close_of_open = match xml[start..].find('>') {
+            Some(i) => start + i + 1,
+            None => break,
+        };
+        let opening = xml[start..close_of_open].to_string();
+
+        // Self-closing form `<w:tag .../>` — emit chunk with empty body.
+        if opening.trim_end().ends_with("/>") {
+            out.push(Chunk {
+                opening: opening.clone(),
+                full: opening,
+            });
+            cursor = close_of_open;
+            continue;
+        }
+
+        // Find matching closing tag.
+        let end_rel = match xml[close_of_open..].find(&close_tag) {
+            Some(i) => i,
+            None => break,
+        };
+        let end = close_of_open + end_rel + close_tag.len();
+        out.push(Chunk {
+            opening,
+            full: xml[start..end].to_string(),
+        });
+        cursor = end;
+    }
+    out
+}
+
+fn find_attr_in_open_tag(opening: &str, key: &[u8]) -> Option<String> {
+    // Parse the opening tag with quick-xml to extract a single attribute robustly.
+    let mut reader = Reader::from_str(opening);
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                return get_attr(e.attributes(), key);
+            }
+            Ok(Event::Eof) => return None,
+            Err(_) => return None,
+            _ => {}
+        }
+    }
 }
 
 // ── Image extraction ───────────────────────────────────────────────────────────
@@ -489,7 +1101,6 @@ fn extract_images(
 ) -> Result<Vec<Image>, ExtractError> {
     let mut images = Vec::new();
 
-    // Collect paths first to avoid borrow-while-iterating issues
     let entries: Vec<(String, String)> = rels
         .values()
         .filter_map(|path| {
@@ -515,13 +1126,12 @@ fn extract_images(
         .collect();
 
     for (path, mime_type) in entries {
-        // Reject paths that could escape the archive root.
         if path.contains("..") || path.starts_with('/') || path.starts_with('\\') {
             eprintln!("warning: skipping image with unsafe path: {path}");
             continue;
         }
 
-        const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
+        const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 
         let mut bytes = Vec::new();
         match archive.by_name(&path) {
@@ -597,8 +1207,6 @@ fn heading_level(style: &str) -> Option<u8> {
 mod tests {
     use super::*;
 
-    // heading_level unit tests
-
     #[test]
     fn heading_level_valid_range() {
         for i in 1u8..=9 {
@@ -631,8 +1239,6 @@ mod tests {
         assert_eq!(heading_level("  Heading1  "), Some(1));
     }
 
-    // lossy unit tests
-
     #[test]
     fn lossy_valid_utf8_is_unchanged() {
         assert_eq!(lossy(b"hello world"), "hello world");
@@ -640,7 +1246,7 @@ mod tests {
 
     #[test]
     fn lossy_invalid_utf8_returns_replacement() {
-        let result = lossy(&[0xFF, 0xFE, 0x41]); // 0xFF 0xFE are invalid, 'A' is valid
+        let result = lossy(&[0xFF, 0xFE, 0x41]);
         assert!(result.contains('\u{FFFD}'));
         assert!(result.ends_with('A'));
     }
