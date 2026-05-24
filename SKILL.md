@@ -1,11 +1,17 @@
 ---
 name: docx-extractor
-description: "Use this skill any time the user provides a .docx file or asks to read, extract, summarize, analyze, or work with the content of a Word document. Triggers include: any mention of a .docx file by name or path; requests to 'read this Word doc', 'summarize this document', 'extract the text/tables/comments/footnotes/images from this file', 'what does this document say', 'find tracked changes', 'list review comments', or 'show me the headings'. Also trigger when the user drops or uploads a .docx file and asks anything about its content. Do NOT trigger for creating new Word documents, editing existing ones, or working with PDF/PPTX/XLSX files."
+description: >-
+  Extract and analyze Word .docx files via the docx-extractor CLI (JSON with
+  sections, tables, comments, footnotes, tracked changes, images). Use when the
+  user provides a .docx file or asks to read, summarize, or analyze a Word
+  document. Do not use for creating or editing docx, or for PDF, PPTX, or XLSX.
 ---
 
 # docx-extractor
 
 You have access to `docx-extractor` — a fast static binary that converts any `.docx` Word file into structured JSON. Use it every time the user wants to read or analyze a Word document. Never attempt to parse `.docx` files manually or with Python libraries.
+
+> On Claude Desktop (which has no shell), use the [`docx-extractor-mcp`](https://github.com/Maks417/docx-extractor/tree/master/mcp) MCP server instead — it handles binary download for you. The shell-based setup below is for Claude Code.
 
 ## Setup (one-time per machine)
 

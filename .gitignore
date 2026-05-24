@@ -1,2 +1,7 @@
 /target
 CLAUDE.md
+.cursor/
+
+# MCP package build artifacts (lockfile is committed)
+/mcp/node_modules
+/mcp/dist

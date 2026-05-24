@@ -91,3 +91,41 @@ jobs:
             artifacts/*
             artifacts/SHA256SUMS.txt
           generate_release_notes: true
+
+  publish-mcp:
+    name: Publish docx-extractor-mcp to npm
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # required for npm Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Upgrade npm to a Trusted-Publishing-aware version
+        run: npm install -g npm@latest
+
+      - name: Sync package version to release tag
+        working-directory: mcp
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "Publishing docx-extractor-mcp@$VERSION"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+
+      - name: Install dependencies
+        working-directory: mcp
+        run: npm install --no-audit --no-fund
+
+      - name: Build
+        working-directory: mcp
+        run: npm run build
+
+      - name: Publish (OIDC via Trusted Publishing — no token)
+        working-directory: mcp
+        run: npm publish --access public --provenance

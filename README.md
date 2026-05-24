@@ -6,6 +6,23 @@
 
 A small Rust CLI that converts a `.docx` file into structured JSON — paragraphs, headings, lists, tables, footnotes, headers/footers, comments, tracked changes, and base64-encoded images. Designed to be consumed programmatically (e.g. by a [Claude skill](SKILL.md)) without needing Microsoft Office.
 
+## Use from Claude Desktop (MCP)
+
+Easiest way for end users. Add this to your `claude_desktop_config.json` (Settings → Developer → Edit Config), restart Claude Desktop, and the `extract_docx` tool is available:
+
+```jsonc
+{
+  "mcpServers": {
+    "docx-extractor": {
+      "command": "npx",
+      "args": ["-y", "docx-extractor-mcp"]
+    }
+  }
+}
+```
+
+The MCP wrapper auto-downloads the matching platform binary on first call and caches it in `~/.cache/docx-extractor-mcp/<version>/`. Requires Node.js 18+. See [mcp/README.md](mcp/README.md) for details.
+
 ## Install
 
 Download the latest binary for your platform from the [Releases](../../releases) page:

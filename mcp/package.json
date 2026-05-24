@@ -1,0 +1,45 @@
+{
+  "name": "docx-extractor-mcp",
+  "version": "0.2.2",
+  "description": "MCP server that wraps the docx-extractor CLI — extract text, tables, footnotes, comments, tracked changes, and images from .docx files as JSON.",
+  "license": "MIT",
+  "author": "Maks417",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Maks417/docx-extractor.git",
+    "directory": "mcp"
+  },
+  "homepage": "https://github.com/Maks417/docx-extractor#readme",
+  "bugs": "https://github.com/Maks417/docx-extractor/issues",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "docx",
+    "word",
+    "claude",
+    "anthropic"
+  ],
+  "type": "module",
+  "bin": {
+    "docx-extractor-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.3"
+  }
+}
