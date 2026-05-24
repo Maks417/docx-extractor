@@ -24,7 +24,24 @@ pub enum ExtractError {
     NotDocx,
 }
 
-pub fn extract(path: &str) -> Result<Document, ExtractError> {
+/// Runtime options controlling what `extract` does. Defaults match the
+/// historical CLI behavior (extract images, 10 MB cap).
+#[derive(Debug, Clone)]
+pub struct ExtractOptions {
+    pub include_images: bool,
+    pub max_image_bytes: u64,
+}
+
+impl Default for ExtractOptions {
+    fn default() -> Self {
+        Self {
+            include_images: true,
+            max_image_bytes: 10 * 1024 * 1024,
+        }
+    }
+}
+
+pub fn extract(path: &str, opts: &ExtractOptions) -> Result<Document, ExtractError> {
     let file = std::fs::File::open(path)?;
     let mut archive = ZipArchive::new(file)?;
 
@@ -52,7 +69,11 @@ pub fn extract(path: &str) -> Result<Document, ExtractError> {
     // Comments — bodies from comments.xml, anchors from the main body parse.
     let comments = parse_comments_file(&mut archive, &rels, &body.comment_anchors)?;
 
-    let images = extract_images(&mut archive, &rels.images)?;
+    let images = if opts.include_images {
+        extract_images(&mut archive, &rels.images, opts.max_image_bytes)?
+    } else {
+        Vec::new()
+    };
     let metadata = parse_core_props(&mut archive)?;
 
     let source = std::path::Path::new(path)
@@ -176,14 +197,24 @@ fn parse_relationships(archive: &mut ZipArchive<std::fs::File>) -> Result<Rels, 
                 }
 
                 if let (Some(id), Some(target)) = (id, target) {
-                    if rel_type.contains("image") {
-                        rels.images.insert(id, format!("word/{target}"));
-                    } else if rel_type.contains("hyperlink") {
-                        rels.hyperlinks.insert(id, target);
-                    } else if rel_type.ends_with("/header") {
-                        rels.headers.insert(id, format!("word/{target}"));
-                    } else if rel_type.ends_with("/footer") {
-                        rels.footers.insert(id, format!("word/{target}"));
+                    // OPC relationship types are URLs like
+                    // ".../relationships/{kind}"; the kind is the final path
+                    // segment. Matching on that avoids false positives like a
+                    // hyperlink URL that happens to contain "image".
+                    match rel_type.rsplit('/').next().unwrap_or("") {
+                        "image" => {
+                            rels.images.insert(id, format!("word/{target}"));
+                        }
+                        "hyperlink" => {
+                            rels.hyperlinks.insert(id, target);
+                        }
+                        "header" => {
+                            rels.headers.insert(id, format!("word/{target}"));
+                        }
+                        "footer" => {
+                            rels.footers.insert(id, format!("word/{target}"));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -309,6 +340,13 @@ pub fn parse_body(xml: &str, rels: &Rels) -> ParsedBody {
     // Comment ranges state.
     let mut open_comment_starts: HashMap<u32, CommentStart> = HashMap::new();
 
+    // Pending lists for O(pending) — not O(total) — fixup at paragraph emit.
+    // Entries here are created with section_index == out.sections.len() (i.e.,
+    // the next section that will be emitted). When that section finally emits,
+    // we drain these and apply the leading-whitespace offset adjustment.
+    let mut pending_revision_indices: Vec<usize> = Vec::new();
+    let mut pending_comment_ids: Vec<u32> = Vec::new();
+
     // Nested-table flatten state — content captured at table_depth >= 2.
     let mut nested_cell = String::new();
     let mut nested_row: Vec<String> = Vec::new();
@@ -351,12 +389,15 @@ pub fn parse_body(xml: &str, rels: &Rels) -> ParsedBody {
                 }
                 b"numPr" if has(&ctx, Ctx::ParaProps) => ctx.push(Ctx::NumPr),
 
-                b"r" if (table_depth(&ctx) == 0 && has(&ctx, Ctx::Para)
-                    || table_depth(&ctx) == 1 && has(&ctx, Ctx::Cell)
-                    || table_depth(&ctx) >= 2 && has(&ctx, Ctx::Body)
-                    || has(&ctx, Ctx::Del)) =>
-                {
-                    ctx.push(Ctx::Run);
+                b"r" => {
+                    let td = table_depth(&ctx);
+                    if (td == 0 && has(&ctx, Ctx::Para))
+                        || (td == 1 && has(&ctx, Ctx::Cell))
+                        || (td >= 2 && has(&ctx, Ctx::Body))
+                        || has(&ctx, Ctx::Del)
+                    {
+                        ctx.push(Ctx::Run);
+                    }
                 }
                 b"t" if has(&ctx, Ctx::Run) => ctx.push(Ctx::Text),
                 b"delText" if has(&ctx, Ctx::Run) && has(&ctx, Ctx::Del) => ctx.push(Ctx::Text),
@@ -540,6 +581,12 @@ pub fn parse_body(xml: &str, rels: &Rels) -> ParsedBody {
                                 finalized_end: None,
                             },
                         );
+                        // Table-internal comments use `cell_text` coordinates and
+                        // their section_index goes stale once the table emits, so
+                        // the paragraph-emit leading-trim fixup must not touch them.
+                        if !in_table {
+                            pending_comment_ids.push(id);
+                        }
                     }
                 }
                 b"commentRangeEnd" if has(&ctx, Ctx::Body) => {
@@ -633,6 +680,13 @@ pub fn parse_body(xml: &str, rels: &Rels) -> ParsedBody {
                                 char_start: state.start_pos,
                                 char_end: end_pos,
                             });
+                            // Table-internal revisions use `cell_text` coordinates
+                            // and their section_index goes stale once the table
+                            // emits, so they must not get the paragraph leading-
+                            // trim fixup at the next td==0 paragraph close.
+                            if !state.in_table {
+                                pending_revision_indices.push(idx);
+                            }
                         }
                     }
                     pop_tag(&mut ctx, Ctx::Ins);
@@ -656,6 +710,9 @@ pub fn parse_body(xml: &str, rels: &Rels) -> ParsedBody {
                                 }),
                                 text: state.buf,
                             });
+                            if !state.in_table {
+                                pending_revision_indices.push(out.revisions.len() - 1);
+                            }
                         }
                     }
                     pop_tag(&mut ctx, Ctx::Del);
@@ -673,22 +730,21 @@ pub fn parse_body(xml: &str, rels: &Rels) -> ParsedBody {
                             let leading = para_text.len() - para_text.trim_start().len();
 
                             // Adjust char positions of any open comments started in this paragraph
-                            // and any revisions targeting this section.
-                            for cs in open_comment_starts.values_mut() {
-                                if cs.section_index == out.sections.len()
-                                    && cs.finalized_end.is_none()
-                                {
-                                    cs.finalized_end = Some(raw_len.saturating_sub(leading));
-                                    cs.char_start = cs.char_start.saturating_sub(leading);
+                            // and any revisions targeting this section. Pending lists hold only
+                            // entries created since the last paragraph emit, so this is O(pending)
+                            // instead of O(open_comment_starts.len() + out.revisions.len()).
+                            for id in pending_comment_ids.drain(..) {
+                                if let Some(cs) = open_comment_starts.get_mut(&id) {
+                                    if cs.finalized_end.is_none() {
+                                        cs.finalized_end = Some(raw_len.saturating_sub(leading));
+                                        cs.char_start = cs.char_start.saturating_sub(leading);
+                                    }
                                 }
                             }
-                            for rev in out.revisions.iter_mut() {
-                                if let Some(anchor) = rev.anchor.as_mut() {
-                                    if anchor.section_index == out.sections.len() {
-                                        anchor.char_start =
-                                            anchor.char_start.saturating_sub(leading);
-                                        anchor.char_end = anchor.char_end.saturating_sub(leading);
-                                    }
+                            for idx in pending_revision_indices.drain(..) {
+                                if let Some(anchor) = out.revisions[idx].anchor.as_mut() {
+                                    anchor.char_start = anchor.char_start.saturating_sub(leading);
+                                    anchor.char_end = anchor.char_end.saturating_sub(leading);
                                 }
                             }
 
@@ -944,6 +1000,42 @@ fn parse_header_footer_parts(
     Ok(out)
 }
 
+struct NoteCapture {
+    start_byte: usize,
+    id: Option<u32>,
+    is_separator: bool,
+}
+
+impl NoteCapture {
+    fn from_start(e: &BytesStart<'_>, start_byte: usize) -> Self {
+        let mut id: Option<u32> = None;
+        let mut is_separator = false;
+        for attr in e.attributes().flatten() {
+            match attr.key.local_name().as_ref() {
+                b"id" => {
+                    if let Ok(v) = lossy(&attr.value).parse::<i64>() {
+                        if v >= 1 {
+                            id = Some(v as u32);
+                        }
+                    }
+                }
+                b"type" => {
+                    let t = lossy(&attr.value);
+                    if t == "separator" || t == "continuationSeparator" {
+                        is_separator = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Self {
+            start_byte,
+            id,
+            is_separator,
+        }
+    }
+}
+
 fn parse_notes_file(
     archive: &mut ZipArchive<std::fs::File>,
     path: &str,
@@ -956,33 +1048,83 @@ fn parse_notes_file(
         Err(_) => return Ok(Vec::new()),
     };
 
-    let tag_str = std::str::from_utf8(note_tag).unwrap_or("");
-    let chunks = split_by_tag(&xml, tag_str);
     let mut out = Vec::new();
-    for chunk in chunks {
-        // Skip separator notes (w:type="separator" or "continuationSeparator").
-        if let Some(t) = find_attr_in_open_tag(&chunk.opening, b"type") {
-            if t == "separator" || t == "continuationSeparator" {
-                continue;
+    let mut reader = Reader::from_str(&xml);
+    let mut buf = Vec::new();
+    let mut capture: Option<NoteCapture> = None;
+    let mut depth: u32 = 0;
+
+    loop {
+        let pos_before = reader.buffer_position() as usize;
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == note_tag => {
+                if capture.is_none() {
+                    capture = Some(NoteCapture::from_start(e, pos_before));
+                }
+                depth += 1;
             }
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == note_tag && depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    let end_pos = reader.buffer_position() as usize;
+                    if let Some(cap) = capture.take() {
+                        if !cap.is_separator {
+                            if let Some(id) = cap.id {
+                                let chunk = &xml[cap.start_byte..end_pos];
+                                let body = parse_body(chunk, rels);
+                                if !body.sections.is_empty() {
+                                    out.push(Note {
+                                        id,
+                                        sections: body.sections,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(ExtractError::Xml(e)),
+            _ => {}
         }
-        let Some(id) =
-            find_attr_in_open_tag(&chunk.opening, b"id").and_then(|v| v.parse::<i64>().ok())
-        else {
-            continue;
-        };
-        if id < 1 {
-            continue;
-        }
-        let body = parse_body(&chunk.full, rels);
-        if !body.sections.is_empty() {
-            out.push(Note {
-                id: id as u32,
-                sections: body.sections,
-            });
-        }
+        buf.clear();
     }
     Ok(out)
+}
+
+struct CommentCapture {
+    start_byte: usize,
+    id: Option<u32>,
+    author: Option<String>,
+    date: Option<String>,
+}
+
+impl CommentCapture {
+    fn from_start(e: &BytesStart<'_>, start_byte: usize) -> Self {
+        let mut id: Option<u32> = None;
+        let mut author: Option<String> = None;
+        let mut date: Option<String> = None;
+        for attr in e.attributes().flatten() {
+            match attr.key.local_name().as_ref() {
+                b"id" => {
+                    id = lossy(&attr.value).parse().ok();
+                }
+                b"author" => {
+                    author = Some(lossy(&attr.value));
+                }
+                b"date" => {
+                    date = Some(lossy(&attr.value));
+                }
+                _ => {}
+            }
+        }
+        Self {
+            start_byte,
+            id,
+            author,
+            date,
+        }
+    }
 }
 
 fn parse_comments_file(
@@ -996,101 +1138,48 @@ fn parse_comments_file(
         Err(_) => return Ok(Vec::new()),
     };
 
-    let chunks = split_by_tag(&xml, "comment");
     let mut out = Vec::new();
-    for chunk in chunks {
-        let id = match find_attr_in_open_tag(&chunk.opening, b"id").and_then(|v| v.parse().ok()) {
-            Some(v) => v,
-            None => continue,
-        };
-        let author = find_attr_in_open_tag(&chunk.opening, b"author");
-        let date = find_attr_in_open_tag(&chunk.opening, b"date");
-        let body = parse_body(&chunk.full, rels);
-        out.push(Comment {
-            id,
-            author,
-            date,
-            anchor: anchors.get(&id).cloned(),
-            sections: body.sections,
-        });
+    let mut reader = Reader::from_str(&xml);
+    let mut buf = Vec::new();
+    let mut capture: Option<CommentCapture> = None;
+    let mut depth: u32 = 0;
+
+    loop {
+        let pos_before = reader.buffer_position() as usize;
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"comment" => {
+                if capture.is_none() {
+                    capture = Some(CommentCapture::from_start(e, pos_before));
+                }
+                depth += 1;
+            }
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"comment" && depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    let end_pos = reader.buffer_position() as usize;
+                    if let Some(cap) = capture.take() {
+                        if let Some(id) = cap.id {
+                            let chunk = &xml[cap.start_byte..end_pos];
+                            let body = parse_body(chunk, rels);
+                            out.push(Comment {
+                                id,
+                                author: cap.author,
+                                date: cap.date,
+                                anchor: anchors.get(&id).cloned(),
+                                sections: body.sections,
+                            });
+                        }
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(ExtractError::Xml(e)),
+            _ => {}
+        }
+        buf.clear();
     }
     out.sort_by_key(|c| c.id);
     Ok(out)
-}
-
-struct Chunk {
-    opening: String, // the opening tag like `<w:footnote w:id="1">`
-    full: String,    // full element including opening and closing tags
-}
-
-/// Split an XML document into chunks bounded by `<w:{tag} ...>` ... `</w:{tag}>`.
-/// Used to break footnotes.xml / endnotes.xml / comments.xml into entries.
-fn split_by_tag(xml: &str, tag: &str) -> Vec<Chunk> {
-    let open_prefix = format!("<w:{tag}");
-    let close_tag = format!("</w:{tag}>");
-    let bytes = xml.as_bytes();
-
-    let mut out = Vec::new();
-    let mut cursor = 0usize;
-
-    while let Some(rel) = xml[cursor..].find(&open_prefix) {
-        let start = cursor + rel;
-        // Reject false matches like `<w:footnoteReference` when looking for `<w:footnote`.
-        let after = bytes.get(start + open_prefix.len()).copied();
-        if !matches!(
-            after,
-            Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r') | Some(b'>') | Some(b'/')
-        ) {
-            cursor = start + open_prefix.len();
-            continue;
-        }
-
-        // Find end of the opening tag.
-        let close_of_open = match xml[start..].find('>') {
-            Some(i) => start + i + 1,
-            None => break,
-        };
-        let opening = xml[start..close_of_open].to_string();
-
-        // Self-closing form `<w:tag .../>` — emit chunk with empty body.
-        if opening.trim_end().ends_with("/>") {
-            out.push(Chunk {
-                opening: opening.clone(),
-                full: opening,
-            });
-            cursor = close_of_open;
-            continue;
-        }
-
-        // Find matching closing tag.
-        let end_rel = match xml[close_of_open..].find(&close_tag) {
-            Some(i) => i,
-            None => break,
-        };
-        let end = close_of_open + end_rel + close_tag.len();
-        out.push(Chunk {
-            opening,
-            full: xml[start..end].to_string(),
-        });
-        cursor = end;
-    }
-    out
-}
-
-fn find_attr_in_open_tag(opening: &str, key: &[u8]) -> Option<String> {
-    // Parse the opening tag with quick-xml to extract a single attribute robustly.
-    let mut reader = Reader::from_str(opening);
-    let mut buf = Vec::new();
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
-                return get_attr(e.attributes(), key);
-            }
-            Ok(Event::Eof) => return None,
-            Err(_) => return None,
-            _ => {}
-        }
-    }
 }
 
 // ── Image extraction ───────────────────────────────────────────────────────────
@@ -1098,30 +1187,33 @@ fn find_attr_in_open_tag(opening: &str, key: &[u8]) -> Option<String> {
 fn extract_images(
     archive: &mut ZipArchive<std::fs::File>,
     rels: &HashMap<String, String>,
+    max_image_bytes: u64,
 ) -> Result<Vec<Image>, ExtractError> {
     let mut images = Vec::new();
 
-    let entries: Vec<(String, String)> = rels
+    let entries: Vec<(String, &'static str)> = rels
         .values()
         .filter_map(|path| {
             let ext = std::path::Path::new(path)
                 .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-            let mime = match ext.as_str() {
-                "png" => "image/png",
-                "jpg" | "jpeg" => "image/jpeg",
-                "gif" => "image/gif",
-                "bmp" => "image/bmp",
-                "tiff" | "tif" => "image/tiff",
-                "webp" => "image/webp",
+                .and_then(|e| e.to_str());
+            let mime = match ext {
+                Some(e) if e.eq_ignore_ascii_case("png") => "image/png",
+                Some(e) if e.eq_ignore_ascii_case("jpg") || e.eq_ignore_ascii_case("jpeg") => {
+                    "image/jpeg"
+                }
+                Some(e) if e.eq_ignore_ascii_case("gif") => "image/gif",
+                Some(e) if e.eq_ignore_ascii_case("bmp") => "image/bmp",
+                Some(e) if e.eq_ignore_ascii_case("tiff") || e.eq_ignore_ascii_case("tif") => {
+                    "image/tiff"
+                }
+                Some(e) if e.eq_ignore_ascii_case("webp") => "image/webp",
                 _ => {
                     eprintln!("warning: skipping unsupported image format: {path}");
                     return None;
                 }
             };
-            Some((path.clone(), mime.to_string()))
+            Some((path.clone(), mime))
         })
         .collect();
 
@@ -1131,14 +1223,13 @@ fn extract_images(
             continue;
         }
 
-        const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
-
         let mut bytes = Vec::new();
         match archive.by_name(&path) {
             Ok(mut f) => {
-                if f.size() > MAX_IMAGE_BYTES {
+                if f.size() > max_image_bytes {
                     eprintln!(
-                        "warning: skipping image larger than 10 MB: {path} ({} bytes)",
+                        "warning: skipping image larger than {} bytes: {path} ({} bytes)",
+                        max_image_bytes,
                         f.size()
                     );
                     continue;
@@ -1159,7 +1250,7 @@ fn extract_images(
 
         images.push(Image {
             id,
-            mime_type,
+            mime_type: mime_type.to_string(),
             base64: BASE64.encode(&bytes),
         });
     }

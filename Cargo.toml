@@ -1,6 +1,6 @@
 [package]
 name = "docx-extractor"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 description = "Extract text, images, footnotes, comments, headers/footers, and tracked changes from DOCX files as JSON"
 license = "MIT"
@@ -24,7 +24,7 @@ assert_cmd = "2"
 tempfile = "3"
 
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = true
 strip = true
 codegen-units = 1

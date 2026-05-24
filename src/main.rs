@@ -5,6 +5,8 @@ use std::process;
 mod output;
 mod parser;
 
+use parser::ExtractOptions;
+
 #[derive(Parser)]
 #[command(
     name = "docx-extractor",
@@ -22,12 +24,28 @@ struct Cli {
     /// Write JSON to this file instead of stdout
     #[arg(short, long)]
     output: Option<String>,
+
+    /// Skip extraction of base64-encoded image data (image references on
+    /// sections are still preserved; the top-level `images` array is empty)
+    #[arg(long)]
+    no_images: bool,
+
+    /// Maximum size of an individual embedded image, in bytes. Images larger
+    /// than this are skipped with a stderr warning. Default: 10485760 (10 MB).
+    #[arg(long, value_name = "BYTES")]
+    max_image_bytes: Option<u64>,
 }
 
 fn main() {
     let cli = Cli::parse();
 
-    match parser::extract(&cli.path) {
+    let defaults = ExtractOptions::default();
+    let opts = ExtractOptions {
+        include_images: !cli.no_images,
+        max_image_bytes: cli.max_image_bytes.unwrap_or(defaults.max_image_bytes),
+    };
+
+    match parser::extract(&cli.path, &opts) {
         Ok(doc) => {
             let json = if cli.pretty {
                 serde_json::to_string_pretty(&doc)

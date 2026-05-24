@@ -9,6 +9,15 @@ import { fileURLToPath } from "node:url";
 
 const REPO = "Maks417/docx-extractor";
 
+// Per-request and overall download timeouts. The binary is small (a few MB),
+// so 30s for any single HTTP call is generous; 5 min is the absolute ceiling
+// to avoid hanging Claude Desktop forever on a stalled connection.
+const FETCH_TIMEOUT_MS = 30_000;
+const DOWNLOAD_TIMEOUT_MS = 300_000;
+
+// Opt-out for offline mirrors or private forks that don't ship SHA256SUMS.txt.
+const SKIP_CHECKSUM_ENV = "DOCX_EXTRACTOR_MCP_SKIP_CHECKSUM";
+
 interface PlatformAsset {
   asset: string;
   binaryName: string;
@@ -58,17 +67,30 @@ async function sha256OfFile(path: string): Promise<string> {
 
 async function downloadTo(url: string, destPath: string): Promise<void> {
   await mkdir(dirname(destPath), { recursive: true });
-  const res = await fetch(url, { redirect: "follow" });
+  const res = await fetch(url, {
+    redirect: "follow",
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
   if (!res.ok || !res.body) {
     throw new Error(`Failed to download ${url}: HTTP ${res.status} ${res.statusText}`);
   }
   const tmp = `${destPath}.tmp-${process.pid}`;
-  await pipeline(Readable.fromWeb(res.body as never), createWriteStream(tmp));
-  await rename(tmp, destPath);
+  try {
+    await pipeline(Readable.fromWeb(res.body as never), createWriteStream(tmp), {
+      signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
+    });
+    await rename(tmp, destPath);
+  } catch (err) {
+    await unlink(tmp).catch(() => {});
+    throw err;
+  }
 }
 
 async function fetchText(url: string): Promise<string> {
-  const res = await fetch(url, { redirect: "follow" });
+  const res = await fetch(url, {
+    redirect: "follow",
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
   if (!res.ok) {
     throw new Error(`Failed to fetch ${url}: HTTP ${res.status} ${res.statusText}`);
   }
@@ -108,17 +130,29 @@ export async function ensureBinary(): Promise<string> {
   const assetUrl = `${base}/${asset}`;
   const sumsUrl = `${base}/SHA256SUMS.txt`;
 
+  const skipChecksum = process.env[SKIP_CHECKSUM_ENV] === "1";
+
   let expected: string | null = null;
-  try {
-    const sums = await fetchText(sumsUrl);
+  if (!skipChecksum) {
+    // Fail fast if SHA256SUMS.txt is unreachable. Silently skipping verification
+    // would hide tampering and corrupt-download issues from a user who never
+    // sees the stderr stream that Claude Desktop discards.
+    let sums: string;
+    try {
+      sums = await fetchText(sumsUrl);
+    } catch (err) {
+      throw new Error(
+        `Could not fetch checksum file ${sumsUrl}: ${(err as Error).message}. ` +
+          `Set ${SKIP_CHECKSUM_ENV}=1 to install without verification (not recommended).`,
+      );
+    }
     expected = expectedHashFromSums(sums, asset);
-  } catch (err) {
-    // SHA256SUMS.txt is optional — keep downloading, just skip verification.
-    process.stderr.write(
-      `docx-extractor-mcp: warning: could not fetch SHA256SUMS.txt (${
-        (err as Error).message
-      }). Proceeding without checksum verification.\n`,
-    );
+    if (!expected) {
+      throw new Error(
+        `Checksum for ${asset} not found in ${sumsUrl}. ` +
+          `Set ${SKIP_CHECKSUM_ENV}=1 to install without verification (not recommended).`,
+      );
+    }
   }
 
   await downloadTo(assetUrl, binPath);

@@ -37,8 +37,15 @@ Extract structured JSON from a `.docx` file.
 |---|---|---|---|
 | `path` | string | yes | Absolute path to the `.docx` file. |
 | `pretty` | boolean | no | Pretty-print the JSON output. |
+| `outputPath` | string | no | If set, write JSON to this absolute path and return a short summary instead of the full document. Use this for large docs to keep them out of the conversation. |
+| `includeImages` | boolean | no | Include base64-encoded image bytes in the response (default: `true`). Set `false` to skip the top-level `images` array; per-section image references are still preserved. |
+| `maxImageBytes` | integer | no | Per-image size cap in bytes (default: `10485760` / 10 MB). Larger images are skipped with a warning. |
 
-Returns the JSON document as text. See the [main project README](https://github.com/Maks417/docx-extractor#output) for the full schema.
+Returns the JSON document as text (or, when `outputPath` is set, a one-line summary). See the [main project README](https://github.com/Maks417/docx-extractor#output) for the full schema.
+
+### Verification & offline mode
+
+On first call the installer downloads `SHA256SUMS.txt` from the release and verifies the binary against it. If the checksum file is unreachable (offline, mirror, private fork), set `DOCX_EXTRACTOR_MCP_SKIP_CHECKSUM=1` in the MCP server's environment to bypass verification — only use this when you trust the upstream.
 
 ## Supported platforms
 

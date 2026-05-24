@@ -618,3 +618,78 @@ fn comment_extracted_with_anchor() {
     assert_eq!(anchor["char_start"], 4);
     assert_eq!(anchor["char_end"], 15);
 }
+
+#[test]
+fn table_internal_insertion_not_trimmed_by_following_paragraph() {
+    // Regression: a tracked insertion inside a table cell must keep its
+    // cell_text-based char positions even when a paragraph *after* the table
+    // starts with significant leading whitespace. The paragraph-emit leading
+    // trim applies to para_text-coordinate entries only.
+    let xml = wrap_body(
+        r#"<w:tbl>
+            <w:tr>
+                <w:tc>
+                    <w:p>
+                        <w:r><w:t>Cell </w:t></w:r>
+                        <w:ins w:author="J" w:date="2024-01-15T10:30:00Z">
+                            <w:r><w:t>X</w:t></w:r>
+                        </w:ins>
+                    </w:p>
+                </w:tc>
+            </w:tr>
+        </w:tbl>
+        <w:p><w:r><w:t>   leading</w:t></w:r></w:p>"#,
+    );
+    let tmp = write_docx(&xml);
+    let doc = run(&tmp);
+    let revisions = doc["revisions"].as_array().unwrap();
+    assert_eq!(revisions.len(), 1);
+    assert_eq!(revisions[0]["kind"], "insert");
+    assert_eq!(revisions[0]["text"], "X");
+    // section_index 0 = the table; cell_text positions stay as-recorded.
+    assert_eq!(revisions[0]["anchor"]["section_index"], 0);
+    assert_eq!(revisions[0]["anchor"]["char_start"], 5);
+    assert_eq!(revisions[0]["anchor"]["char_end"], 6);
+}
+
+#[test]
+fn table_internal_comment_not_trimmed_by_following_paragraph() {
+    // Same regression as table_internal_insertion_*, but for comment anchors.
+    let comments_xml = r#"<?xml version="1.0"?>
+<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:comment w:id="0" w:author="R" w:date="2024-02-01T12:00:00Z">
+    <w:p><w:r><w:t>note</w:t></w:r></w:p>
+  </w:comment>
+</w:comments>"#;
+
+    let doc_xml = wrap_body(
+        r#"<w:tbl>
+            <w:tr>
+                <w:tc>
+                    <w:p>
+                        <w:r><w:t>Cell </w:t></w:r>
+                        <w:commentRangeStart w:id="0"/>
+                        <w:r><w:t>X</w:t></w:r>
+                        <w:commentRangeEnd w:id="0"/>
+                    </w:p>
+                </w:tc>
+            </w:tr>
+        </w:tbl>
+        <w:p><w:r><w:t>   leading</w:t></w:r></w:p>"#,
+    );
+
+    let tmp = write_multifile_docx(&[
+        ("word/document.xml", doc_xml.as_bytes()),
+        ("word/comments.xml", comments_xml.as_bytes()),
+    ]);
+
+    let doc = run(&tmp);
+    let comments = doc["comments"].as_array().unwrap();
+    assert_eq!(comments.len(), 1);
+    let anchor = &comments[0]["anchor"];
+    assert_eq!(anchor["section_index"], 0);
+    // cell_text positions of "X" within "Cell X" — must not be shifted by the
+    // following paragraph's 3-char leading whitespace.
+    assert_eq!(anchor["char_start"], 5);
+    assert_eq!(anchor["char_end"], 6);
+}

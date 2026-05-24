@@ -34,7 +34,7 @@ Download the latest binary for your platform from the [Releases](../../releases)
 | macOS Apple Silicon | `docx-extractor-macos-aarch64` |
 | Windows x86-64 | `docx-extractor-windows-x86_64.exe` |
 
-Make it executable (`chmod +x docx-extractor-linux-x86_64`) and put it on your `PATH`, or invoke it by full path.
+Make it executable (`chmod +x docx-extractor-linux-x86_64`) and put it on your `PATH`, or invoke it by full path. The Windows asset is named `docx-extractor-windows-x86_64.exe` for clarity on the Releases page — rename it to `docx-extractor.exe` once it's on your `PATH`.
 
 Or build from source:
 
@@ -46,9 +46,11 @@ cargo build --release
 ## Usage
 
 ```bash
-docx-extractor path/to/file.docx                 # JSON to stdout
-docx-extractor path/to/file.docx --pretty        # pretty-printed
-docx-extractor path/to/file.docx --output out.json
+docx-extractor path/to/file.docx                       # JSON to stdout
+docx-extractor path/to/file.docx --pretty              # pretty-printed
+docx-extractor path/to/file.docx --output out.json     # write to file
+docx-extractor path/to/file.docx --no-images           # skip base64 image bytes
+docx-extractor path/to/file.docx --max-image-bytes 1048576   # cap individual images at 1 MB
 ```
 
 ## Output

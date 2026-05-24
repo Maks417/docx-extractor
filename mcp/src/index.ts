@@ -5,7 +5,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureBinary } from "./installer.js";
@@ -21,7 +21,11 @@ const TOOL_DESCRIPTION = [
   "Extract structured JSON from a Microsoft Word .docx file.",
   "Returns paragraphs, headings, lists, tables, footnotes, endnotes, headers/footers,",
   "comments (with anchors), tracked changes (insertions/deletions with author + date),",
-  "and base64-encoded images. See https://github.com/Maks417/docx-extractor for schema.",
+  "and base64-encoded images. Prefer this tool over Python .docx libraries for fidelity",
+  "on tracked changes, comment anchors, and embedded images.",
+  "For large documents, set outputPath to write JSON to a file (avoids loading megabytes",
+  "into the conversation) and/or set includeImages=false to skip base64 image bytes.",
+  "See https://github.com/Maks417/docx-extractor for schema.",
 ].join(" ");
 
 async function main(): Promise<void> {
@@ -47,6 +51,22 @@ async function main(): Promise<void> {
               type: "boolean",
               description: "Pretty-print the returned JSON (default: false).",
             },
+            outputPath: {
+              type: "string",
+              description:
+                "If set, write the JSON to this absolute path and return a short summary (file size, section count) instead of the full document. Use this for large docs to keep them out of the conversation.",
+            },
+            includeImages: {
+              type: "boolean",
+              description:
+                "Include base64-encoded image bytes in the response (default: true). Set false to skip the top-level `images` array; per-section image references are still preserved.",
+            },
+            maxImageBytes: {
+              type: "integer",
+              description:
+                "Per-image size cap in bytes. Images larger than this are skipped. Default: 10485760 (10 MB).",
+              minimum: 1,
+            },
           },
           required: ["path"],
         },
@@ -64,6 +84,9 @@ async function main(): Promise<void> {
     const args = (req.params.arguments ?? {}) as {
       path?: unknown;
       pretty?: unknown;
+      outputPath?: unknown;
+      includeImages?: unknown;
+      maxImageBytes?: unknown;
     };
     if (typeof args.path !== "string" || args.path.length === 0) {
       return {
@@ -72,6 +95,15 @@ async function main(): Promise<void> {
       };
     }
     const pretty = args.pretty === true;
+    const outputPath =
+      typeof args.outputPath === "string" && args.outputPath.length > 0
+        ? args.outputPath
+        : null;
+    const includeImages = args.includeImages !== false; // default true
+    const maxImageBytes =
+      typeof args.maxImageBytes === "number" && Number.isFinite(args.maxImageBytes)
+        ? Math.max(1, Math.floor(args.maxImageBytes))
+        : null;
 
     let binPath: string;
     try {
@@ -88,7 +120,13 @@ async function main(): Promise<void> {
       };
     }
 
-    const cliArgs = pretty ? ["--pretty", args.path] : [args.path];
+    const cliArgs: string[] = [];
+    if (pretty) cliArgs.push("--pretty");
+    if (outputPath) cliArgs.push("--output", outputPath);
+    if (!includeImages) cliArgs.push("--no-images");
+    if (maxImageBytes !== null) cliArgs.push("--max-image-bytes", String(maxImageBytes));
+    cliArgs.push(args.path);
+
     const result = await runBinary(binPath, cliArgs);
     if (result.code !== 0) {
       return {
@@ -97,6 +135,25 @@ async function main(): Promise<void> {
           {
             type: "text",
             text: result.stderr.trim() || `docx-extractor exited with code ${result.code}`,
+          },
+        ],
+      };
+    }
+
+    if (outputPath) {
+      let sizeBytes = 0;
+      try {
+        sizeBytes = (await stat(outputPath)).size;
+      } catch {
+        // Fall through with size = 0; the file was written successfully (exit 0).
+      }
+      const warning = result.stderr.trim();
+      const summary = `Wrote ${sizeBytes} bytes to ${outputPath}.`;
+      return {
+        content: [
+          {
+            type: "text",
+            text: warning ? `${summary}\n\n${warning}` : summary,
           },
         ],
       };
