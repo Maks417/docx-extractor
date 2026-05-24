@@ -1,6 +1,6 @@
 {
   "name": "docx-extractor-mcp",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "MCP server that wraps the docx-extractor CLI — extract text, tables, footnotes, comments, tracked changes, and images from .docx files as JSON.",
   "license": "MIT",
   "author": "Maks417",
