@@ -18,29 +18,41 @@ and embedded image bytes that the Python tools miss.
 
 ## Pick the right path for this surface
 
-**1. Claude Desktop (no shell, no `subprocess`)** — the `extract_docx` MCP tool
-is the only path. If `extract_docx` is listed in your available tools, just
-call it with `{ "path": "<absolute path>" }`. If it is not listed, tell the
-user to install the MCP server (see [mcp/README.md](mcp/README.md)) and stop —
-do **not** try shell commands.
+Decide in this order — pick the first one that applies:
 
-**2. Claude Code (shell available)** — call the `docx-extractor` binary via
-`Bash`. If it isn't on `PATH`, install it once with the snippet below, then
-invoke it.
+**1. You have shell / `subprocess` and the `.docx` is on your filesystem**
+(Claude Code, or Claude Desktop's analysis sandbox with an uploaded file at
+`/mnt/user-data/uploads/...`) — call the `docx-extractor` binary directly.
+This is the fastest path: no host/sandbox boundary crossing, no base64
+re-encoding of the file. If the binary isn't on `PATH`, install it once with
+the snippet for your environment below.
 
-The rest of this file describes both paths and the JSON output schema they
-share.
+**2. No shell, but the `extract_docx` MCP tool is available and the file lives
+on the MCP server's filesystem** (Claude Desktop pointed at a host file via
+the Files connector, or any MCP client where the path resolves on the server)
+— call `extract_docx` with `{ "path": "<absolute path>" }`.
 
-## Calling `extract_docx` (Claude Desktop / any MCP client)
+**3. No shell, MCP tool available, but the file is on a different filesystem
+than the MCP server** (e.g. Claude Desktop upload + host-side MCP) — the MCP
+server cannot see the upload. Tell the user to either move the file to a
+host-visible directory or rely on path 1 instead. Do **not** try to base64 the
+whole file through the tool call; it defeats the point of a native parser.
+
+The rest of this file describes both invocation styles and the JSON output
+schema they share.
+
+## Calling `extract_docx` (MCP — no shell available)
 
 ```jsonc
 // Tool input
 { "path": "/absolute/path/to/file.docx", "pretty": false }
 ```
 
-The tool returns the JSON document as a single text payload. Schema below.
+`path` must resolve on the **MCP server's** filesystem, which is normally the
+host machine — not inside a Claude Desktop analysis sandbox. The tool returns
+the JSON document as a single text payload. Schema below.
 
-## Calling the binary (Claude Code)
+## Calling the binary (Claude Code or Claude Desktop sandbox)
 
 ```bash
 docx-extractor /absolute/path/to/file.docx > document.json
@@ -53,9 +65,11 @@ docx-extractor /absolute/path/to/file.docx --output document.json
 Exit code `0` = success. Exit code `1` = error (details on stderr). On Windows
 the binary is `docx-extractor.exe`.
 
-### One-time install (Claude Code only)
+### One-time install (shell environments — Claude Code or sandbox)
 
-Skip if `command -v docx-extractor` already resolves.
+Skip if `command -v docx-extractor` already resolves. The macOS/Linux snippet
+also works inside Claude Desktop's Linux analysis sandbox — it detects the
+platform and pulls the matching release asset.
 
 ```bash
 # macOS / Linux
@@ -115,12 +129,14 @@ Hyperlinks are inlined as markdown `[text](url)` directly in section text.
 
 Base64 image bytes can dominate the response. Two strategies:
 
-- **Claude Code:** redirect to a file with `--output document.json`, then
-  read only the slices you need (`.sections[…]`, `.comments[…]`).
-- **Either surface:** call `extract_docx` with `pretty: false`, then parse the
-  JSON and drop `images` / `revisions` if the user only asked for the body.
+- **Shell environments (Claude Code / sandbox):** redirect to a file with
+  `--output document.json`, then read only the slices you need
+  (`.sections[…]`, `.comments[…]`).
+- **MCP:** pass `outputPath` so the server writes the JSON to disk and
+  returns only a short summary, or pass `includeImages: false` to drop the
+  base64 image payload.
 
-## Common task patterns (Claude Code, after a shell call)
+## Common task patterns (after a shell call)
 
 ### Summarize document body
 
