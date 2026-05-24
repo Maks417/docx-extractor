@@ -1,0 +1,10 @@
+# Files included in the sdist. The sdist itself ships no binary — it's a
+# fallback installation path that raises a clear error directing users to a
+# binary wheel. Build artifacts (the bin/ directory) are wheel-only.
+include README.md
+include pyproject.toml
+include setup.py
+recursive-include src/docx_extractor *.py
+prune src/docx_extractor/bin
+prune **/__pycache__
+global-exclude *.pyc

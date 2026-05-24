@@ -4,6 +4,8 @@
 
 On first call the server downloads the matching `docx-extractor` binary from GitHub Releases into `~/.cache/docx-extractor-mcp/<version>/`, verifies its SHA-256, and caches it for subsequent runs.
 
+> **Working with files uploaded into Claude Desktop?** The MCP server runs on the host machine and cannot see files inside Claude Desktop's analysis sandbox (`/mnt/user-data/uploads/...`). For that case, install the Python wrapper directly inside the sandbox instead: `pip install docx-extractor-cli` — it bundles the same binary and works on the sandbox upload path. See the [Python package README](https://github.com/Maks417/docx-extractor/tree/main/python).
+
 ## Install in Claude Desktop
 
 Add this to your `claude_desktop_config.json` (Settings → Developer → Edit Config):

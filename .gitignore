@@ -5,3 +5,17 @@ CLAUDE.md
 # MCP package build artifacts (lockfile is committed)
 /mcp/node_modules
 /mcp/dist
+
+# Python package build artifacts and bundled binaries
+/python/build/
+/python/dist/
+/python/src/*.egg-info/
+# Bundled binaries are staged into bin/ at wheel-build time by release.yml.
+# Keep the directory itself via .gitkeep but never commit the platform binaries.
+/python/src/docx_extractor/bin/*
+!/python/src/docx_extractor/bin/.gitkeep
+# Python bytecode and venvs
+__pycache__/
+*.py[cod]
+.venv/
+venv/

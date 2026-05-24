@@ -18,41 +18,46 @@ and embedded image bytes that the Python tools miss.
 
 ## Pick the right path for this surface
 
-Decide in this order — pick the first one that applies:
+Decide in this order — pick the **first** path whose preconditions are met:
 
-**1. You have shell / `subprocess` and the `.docx` is on your filesystem**
-(Claude Code, or Claude Desktop's analysis sandbox with an uploaded file at
-`/mnt/user-data/uploads/...`) — call the `docx-extractor` binary directly.
-This is the fastest path: no host/sandbox boundary crossing, no base64
-re-encoding of the file. If the binary isn't on `PATH`, install it once with
-the snippet for your environment below.
+**Step 0 — detect surface.**
+- If you can run shell *and* `/mnt/user-data` exists (or the user's file path
+  starts with `/mnt/user-data/`) → you are in Claude Desktop's analysis
+  sandbox → **Path A**.
+- Else if you have shell available (Bash / PowerShell / `subprocess`) →
+  **Path B**.
+- Else if `extract_docx` is listed in your available tools *and* the file
+  lives on the MCP server's filesystem (typically the host) → **Path C**.
+- Else: tell the user there is no working path on this surface and stop. Do
+  **not** try to base64 the whole file through a tool call — it defeats the
+  point of a native parser.
 
-**2. No shell, but the `extract_docx` MCP tool is available and the file lives
-on the MCP server's filesystem** (Claude Desktop pointed at a host file via
-the Files connector, or any MCP client where the path resolves on the server)
-— call `extract_docx` with `{ "path": "<absolute path>" }`.
+### Path A — Sandbox with code execution (Claude Desktop uploads)
 
-**3. No shell, MCP tool available, but the file is on a different filesystem
-than the MCP server** (e.g. Claude Desktop upload + host-side MCP) — the MCP
-server cannot see the upload. Tell the user to either move the file to a
-host-visible directory or rely on path 1 instead. Do **not** try to base64 the
-whole file through the tool call; it defeats the point of a native parser.
+The fastest path for files at `/mnt/user-data/uploads/...`. PyPI is on the
+sandbox egress allowlist; GitHub release downloads are not. So install the
+binary via pip and invoke it locally:
 
-The rest of this file describes both invocation styles and the JSON output
-schema they share.
-
-## Calling `extract_docx` (MCP — no shell available)
-
-```jsonc
-// Tool input
-{ "path": "/absolute/path/to/file.docx", "pretty": false }
+```bash
+pip install docx-extractor-cli
+docx-extractor /mnt/user-data/uploads/foo.docx --no-images --output /tmp/doc.json
 ```
 
-`path` must resolve on the **MCP server's** filesystem, which is normally the
-host machine — not inside a Claude Desktop analysis sandbox. The tool returns
-the JSON document as a single text payload. Schema below.
+Then load `/tmp/doc.json` in Python and work with the dict. `--no-images` is
+the **default for chat workflows** — base64 image bytes dominate token cost
+and the user rarely needs the raw bytes inline. Opt in (`--images`-omitted)
+only when the user explicitly asks about embedded images.
 
-## Calling the binary (Claude Code or Claude Desktop sandbox)
+You can also use the Python API directly:
+
+```python
+import docx_extractor
+doc = docx_extractor.extract("/mnt/user-data/uploads/foo.docx", no_images=True)
+```
+
+### Path B — Host shell (Claude Code)
+
+Call the `docx-extractor` binary via `Bash`:
 
 ```bash
 docx-extractor /absolute/path/to/file.docx > document.json
@@ -62,14 +67,32 @@ docx-extractor /absolute/path/to/file.docx --pretty
 docx-extractor /absolute/path/to/file.docx --output document.json
 ```
 
-Exit code `0` = success. Exit code `1` = error (details on stderr). On Windows
-the binary is `docx-extractor.exe`.
+Exit code `0` = success, `1` = error (details on stderr). On Windows the
+binary is `docx-extractor.exe`.
 
-### One-time install (shell environments — Claude Code or sandbox)
+If Python is available, `pip install docx-extractor-cli` works here too and
+gives you the same `docx-extractor` console script plus the Python API.
 
-Skip if `command -v docx-extractor` already resolves. The macOS/Linux snippet
-also works inside Claude Desktop's Linux analysis sandbox — it detects the
-platform and pulls the matching release asset.
+### Path C — MCP only (no shell, no code execution)
+
+If `extract_docx` is in your tools and the file is on the MCP server's
+filesystem:
+
+```jsonc
+// Tool input
+{ "path": "/absolute/path/to/file.docx", "pretty": false }
+```
+
+`path` must resolve on the MCP server's filesystem (typically the host
+machine). Files uploaded into Claude Desktop's analysis sandbox at
+`/mnt/user-data/uploads/...` are **not** visible to a host-side MCP server —
+that case is **Path A**, not Path C.
+
+### One-time install (Path B only — Claude Code)
+
+Skip if `command -v docx-extractor` already resolves. The simplest install
+on any platform with Python is `pip install docx-extractor-cli`. The
+GitHub-release direct download is the alternative:
 
 ```bash
 # macOS / Linux
@@ -91,6 +114,10 @@ Invoke-WebRequest `
   -Uri "https://github.com/Maks417/docx-extractor/releases/latest/download/docx-extractor-windows-x86_64.exe" `
   -OutFile "$dir\docx-extractor.exe"
 ```
+
+> Do **not** try this snippet inside Claude Desktop's analysis sandbox — the
+> GitHub release host is not on the sandbox egress allowlist. Use Path A
+> (`pip install`) instead.
 
 ## JSON output shape
 
@@ -127,16 +154,18 @@ Hyperlinks are inlined as markdown `[text](url)` directly in section text.
 
 ## Avoiding context bloat on big documents
 
-Base64 image bytes can dominate the response. Two strategies:
+Base64 image bytes can dominate the response. Strategies, in order of impact:
 
-- **Shell environments (Claude Code / sandbox):** redirect to a file with
-  `--output document.json`, then read only the slices you need
+- **Drop images at extraction time** (Path A / B): pass `--no-images` to the
+  binary, or `no_images=True` to `docx_extractor.extract`. This is the
+  recommended default for any chat workflow.
+- **Write to disk, slice from disk** (Path A / B): pass `--output doc.json`
+  (or `output=` to the Python API), then load only the slices you need
   (`.sections[…]`, `.comments[…]`).
-- **MCP:** pass `outputPath` so the server writes the JSON to disk and
-  returns only a short summary, or pass `includeImages: false` to drop the
-  base64 image payload.
+- **MCP equivalent** (Path C): set `outputPath` to write to disk and get a
+  short summary back, and/or `includeImages: false` to drop image bytes.
 
-## Common task patterns (after a shell call)
+## Common task patterns (after a shell call or `extract()`)
 
 ### Summarize document body
 

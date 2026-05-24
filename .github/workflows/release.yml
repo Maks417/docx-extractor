@@ -1,3 +1,9 @@
+# IMPORTANT: PyPI Trusted Publishing and npm Trusted Publishing both pin the
+# OIDC subject to this exact workflow filename (release.yml). Renaming this
+# file requires updating the Trusted Publisher configuration on PyPI
+# (https://pypi.org/manage/project/docx-extractor-cli/settings/publishing/)
+# and npm (https://www.npmjs.com/package/docx-extractor-mcp/access) FIRST,
+# or publishing will silently fail.
 name: Release
 
 on:
@@ -127,3 +133,147 @@ jobs:
       - name: Publish (OIDC via Trusted Publishing — no token)
         working-directory: mcp
         run: npm publish --access public --provenance
+
+  build-wheels:
+    name: Build wheel ${{ matrix.plat-name }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - artifact: docx-extractor-linux-x86_64
+            binary-name: docx-extractor
+            plat-name: manylinux_2_28_x86_64
+          - artifact: docx-extractor-macos-x86_64
+            binary-name: docx-extractor
+            plat-name: macosx_11_0_x86_64
+          - artifact: docx-extractor-macos-aarch64
+            binary-name: docx-extractor
+            plat-name: macosx_11_0_arm64
+          - artifact: docx-extractor-windows-x86_64.exe
+            binary-name: docx-extractor.exe
+            plat-name: win_amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Download platform binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: artifacts
+
+      - name: Stage binary inside the package
+        run: |
+          mkdir -p python/src/docx_extractor/bin
+          cp "artifacts/${{ matrix.artifact }}" "python/src/docx_extractor/bin/${{ matrix.binary-name }}"
+          chmod +x "python/src/docx_extractor/bin/${{ matrix.binary-name }}" || true
+
+      - name: Sync wheel version to release tag
+        working-directory: python
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "Building docx-extractor wheel @ $VERSION (${{ matrix.plat-name }})"
+          # Replace the `version = "..."` line in pyproject.toml in place.
+          # `--` so sed -i doesn't eat any future flags.
+          sed -i -E "s/^version = \".*\"/version = \"$VERSION\"/" pyproject.toml
+          grep -E '^version = ' pyproject.toml
+          # Also bump the __version__ string in __init__.py so introspection
+          # (`docx_extractor.__version__`) matches the wheel metadata.
+          sed -i -E "s/^__version__ = \".*\"/__version__ = \"$VERSION\"/" src/docx_extractor/__init__.py
+
+      - name: Install build tooling
+        run: pip install --upgrade setuptools wheel
+
+      - name: Build wheel
+        working-directory: python
+        # Direct setup.py invocation is the canonical way to produce a
+        # platform-tagged wheel with a bundled prebuilt binary. The PEP 517
+        # `python -m build` path can also do this via --config-setting, but
+        # the option chain is fragile across pip/build versions; bdist_wheel
+        # --plat-name is stable and supported.
+        #
+        # `--python-tag=py3` is essential: BinaryDistribution.has_ext_modules
+        # is True so the wheel is non-pure, which would otherwise default the
+        # Python tag to the runner's interpreter (e.g. cp311) and lock the
+        # wheel to that exact Python version. We have no real C extension
+        # (the bundled binary is invoked via subprocess), so py3-none-<plat>
+        # is correct: any Python 3 on the right platform can use it.
+        run: python setup.py bdist_wheel --plat-name=${{ matrix.plat-name }} --python-tag=py3
+
+      - name: Inspect wheel (Linux only — confirm manylinux tag)
+        if: matrix.plat-name == 'manylinux_2_28_x86_64'
+        run: |
+          pip install auditwheel
+          # Don't repair — the binary is statically self-contained and has no
+          # Python extension to patch. Just verify the platform tag we set is
+          # compatible with the binary's actual dependencies.
+          auditwheel show python/dist/*.whl || true
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.plat-name }}
+          path: python/dist/*.whl
+
+  build-sdist:
+    name: Build sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Sync sdist version to release tag
+        working-directory: python
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          sed -i -E "s/^version = \".*\"/version = \"$VERSION\"/" pyproject.toml
+          sed -i -E "s/^__version__ = \".*\"/__version__ = \"$VERSION\"/" src/docx_extractor/__init__.py
+
+      - name: Install build tooling
+        run: pip install --upgrade build
+
+      - name: Build sdist
+        working-directory: python
+        run: python -m build --sdist
+
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: python/dist/*.tar.gz
+
+  publish-pypi:
+    name: Publish docx-extractor-cli to PyPI
+    needs: [build-wheels, build-sdist, release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # required for PyPI Trusted Publishing (OIDC)
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download sdist
+        uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+      - name: List artifacts to publish
+        run: ls -la dist/
+
+      - name: Publish to PyPI (OIDC via Trusted Publishing — no token)
+        uses: pypa/gh-action-pypi-publish@release/v1

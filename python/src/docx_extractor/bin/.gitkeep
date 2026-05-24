@@ -1,0 +1,4 @@
+# Placeholder so the `bin/` directory exists in the source tree.
+# At wheel build time, .github/workflows/release.yml downloads the matching
+# platform binary into this directory before `python -m build --wheel` runs.
+# The built wheel contains the binary; this .gitkeep is not shipped.
